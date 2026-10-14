@@ -8,7 +8,7 @@ export const INSTRUCTIONS = `Talk to Affinity controls Affinity by Canva through
 
 Workflow:
 1. Call get_status first. When it reports connected: false, give the user the fix it returns.
-2. Read the document before changing it.
+2. Read before changing: get_document for the overview and layer tree, get_nodes for exact styling, list_fonts for installed fonts.
 3. After every visual change, call render and look at the image; compare it with a reference when the user gave one.
 4. Use run_script only for what the typed tools do not cover. It runs Affinity's JavaScript SDK; look the SDK up with sdk_docs first.
 
@@ -40,6 +40,11 @@ if (!d) return null;
 const spreads = [...d.spreads];
 const current = d.currentSpread;
 return { id: d.sessionUuid, spreads: spreads.length, spread: Math.max(0, spreads.findIndex((s) => s.isSameNode(current))), selection: d.selection.length };`;
+
+const NO_DOCUMENT = 'No document is open in Affinity. Open or create one first.';
+const IDS =
+  'IDs: an ID without "/" is a stable tag; an ID with "/" is a position (spread/child/child..., children counted back to front from 0) that can change when the tree changes, so read again after edits.';
+const TYPES = ['artboard', 'rect', 'ellipse', 'star', 'shape', 'path', 'text', 'image', 'layer', 'group', 'raster', 'adjustment', 'filter', 'other'] as const;
 
 const ok = (value: unknown): CallToolResult => ({ content: [{ type: 'text', text: typeof value === 'string' ? value : JSON.stringify(value) }] });
 const fail = (text: string): CallToolResult => ({ content: [{ type: 'text', text }], isError: true });
@@ -182,7 +187,7 @@ export function createServer(upstream: Upstream): McpServer {
     },
     guarded(async ({ target, spreadIndex }) => {
       const info = (await upstream.runScript(RENDER_INFO, { readOnly: true, timeoutMs: 10000 })).result as { id: string; spreads: number; spread: number; selection: number } | null;
-      if (!info) return fail('No document is open in Affinity. Open or create one first.');
+      if (!info) return fail(NO_DOCUMENT);
       if (target === 'selection') {
         if (!info.selection) return fail('Nothing is selected in the current document.');
         return upstream.call('render_selection', { document_session_uuid: info.id }, { readOnly: true });
@@ -191,6 +196,53 @@ export function createServer(upstream: Upstream): McpServer {
       if (index >= info.spreads) return fail(`Spread ${index} does not exist; the document has ${info.spreads} spread(s), indexed from 0.`);
       return upstream.call('render_spread', { document_session_uuid: info.id, spread_index: index }, { readOnly: true });
     }),
+  );
+
+  /** Runs one read-library call (plan 002 section 1): null means no document, {fail} a failed precondition. */
+  const read = async (call: string): Promise<CallToolResult> => {
+    const { result } = await upstream.runScript(`return ${call};`, { readOnly: true, timeoutMs: 30000 });
+    if (result === null) return fail(NO_DOCUMENT);
+    const failed = (result as { fail?: string }).fail;
+    return failed ? fail(failed) : ok(result);
+  };
+
+  server.registerTool(
+    'get_document',
+    {
+      title: 'Read document',
+      description: `Describe the current document: size in pixels, DPI, units, the spread (default: the current one) with its artboards, the selected node IDs, the fonts in use, and the layer tree back to front, to depth levels and at most limit nodes. With query, return instead a flat list of the spread's nodes at any depth that match every given condition: type, name (part, any case), text content (part, any case). Boxes are [x, y, width, height] in document pixels; fields at their default are left out. Use get_nodes for fills, strokes, effects and text styling. ${IDS}`,
+      inputSchema: {
+        spreadIndex: z.number().int().min(0).optional(),
+        depth: z.number().int().min(1).max(20).default(2),
+        limit: z.number().int().min(1).max(2000).default(500),
+        query: z.object({ type: z.enum(TYPES).optional(), name: z.string().min(1).optional(), text: z.string().min(1).optional() }).optional(),
+      },
+      annotations: { readOnlyHint: true },
+    },
+    guarded(async (args) => read(`ttam.getDocument(${JSON.stringify(args)})`)),
+  );
+
+  server.registerTool(
+    'get_nodes',
+    {
+      title: 'Read nodes',
+      description: `Return the exact properties of up to 100 nodes of the current document, one entry per ID in the given order: type, name, box, parent, child count and, when they differ from the default, visible box, rotation in degrees, opacity, blend mode, hidden, locked; fill ("#rrggbbaa", a gradient with stops, or null); stroke (colour, width in pixels, alignment, cap, join, dash, or null); text (content, styled runs with family, style, weight, italic, size in points and colour, paragraph alignment); layer effects. An unknown ID returns {id, error}. ${IDS}`,
+      inputSchema: { ids: z.array(z.string().min(1)).min(1).max(100) },
+      annotations: { readOnlyHint: true },
+    },
+    guarded(async ({ ids }) => read(`ttam.getNodes(${JSON.stringify(ids)})`)),
+  );
+
+  server.registerTool(
+    'list_fonts',
+    {
+      title: 'List fonts',
+      description:
+        "List the font families installed for Affinity, sorted by name, each with its styles (name, weight, italic), plus the total and the matching family count. query keeps families whose name contains it (any case). Check fonts here before using them: Affinity replaces a missing font silently.",
+      inputSchema: { query: z.string().optional(), limit: z.number().int().min(1).max(500).default(50) },
+      annotations: { readOnlyHint: true },
+    },
+    guarded(async (args) => read(`ttam.listFonts(${JSON.stringify(args)})`)),
   );
 
   return server;

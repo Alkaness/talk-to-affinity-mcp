@@ -184,3 +184,171 @@ export async function refusedUrl(): Promise<string> {
   await new Promise((resolve) => s.close(resolve));
   return `http://127.0.0.1:${port}/sse`;
 }
+
+// Slice 002: SDK-like documents for the read tools (research R-19 to R-31).
+
+/** An SDK enum value: it stringifies to its key name (R-29). */
+export const en = (name: string) => ({ isEnumValue: true, toString: () => name });
+const rgba8 = (hex: string) => {
+  const v = parseInt(hex.slice(1), 16);
+  return { r: (v >>> 24) & 255, g: (v >>> 16) & 255, b: (v >>> 8) & 255, alpha: v & 255 };
+};
+export const solid = (hex: string) => ({ fillType: en('Solid'), fill: { colour: { rgba8: rgba8(hex) } } });
+export const NO_FILL = { fillType: en('None'), fill: {} };
+/** A gradient fill; `type` is the raw number the SDK returns (R-29). */
+export const gradient = (type: number, stops: [number, string][]) => ({
+  fillType: en('Gradient'),
+  fill: { gradientFillType: type, gradient: { stops: stops.map(([position, hex]) => ({ position, midpoint: 0.5, colour: { rgba8: rgba8(hex) } })) } },
+});
+const box = (b: number[]) => ({ x: b[0], y: b[1], width: b[2], height: b[3] });
+export const NO_EXTENT = [-1.7976931348623157e308, -1.7976931348623157e308, 0, 0]; // R-21
+const collection = (items: object[]) => ({ toArray: () => items.slice(), [Symbol.iterator]: () => items[Symbol.iterator](), get length() { return items.length; } });
+
+export type Run = [begin: number, end: number, family: string, style: string, weight: number, italic: boolean, heightPx: number, hex: string];
+
+export interface NodeProps {
+  name?: string;
+  tag?: string;
+  shape?: string;
+  box?: number[];
+  visibleBox?: number[];
+  fill?: string | object;
+  pen?: string;
+  width?: number;
+  dash?: number[];
+  hidden?: boolean;
+  locked?: boolean;
+  artboard?: boolean;
+  rotation?: number; // radians
+  opacity?: number;
+  blend?: string;
+  effects?: object[];
+  text?: string;
+  runs?: Run[];
+  paragraphs?: [begin: number, end: number, align: string][];
+}
+
+/** A node as the SDK presents it; children are listed back to front (R-20). Assignments go to `log`. */
+export function fakeNode(cls: string, p: NodeProps = {}, kids: object[] = [], log: string[] = []): any {
+  const tags: Record<string, string> = p.tag ? { 'ttam-id': p.tag } : {};
+  const text = p.text ?? '';
+  const points = [...text]; // story positions count code points (R-30)
+  const target: any = {
+    [Symbol.toStringTag]: cls,
+    description: p.name ?? cls,
+    spreadBaseBox: box(p.box ?? [0, 0, 10, 10]),
+    spreadVisibleBox: box(p.visibleBox ?? p.box ?? [0, 0, 10, 10]),
+    isVisible: !p.hidden,
+    isLocked: !!p.locked,
+    isArtboardEnabled: !!p.artboard,
+    transform: { decompose: () => ({ rotation: p.rotation ?? 0, scaleX: 1, scaleY: 1, shear: 0, translateX: 0, translateY: 0 }) },
+    globalOpacity: p.opacity ?? 1,
+    blendMode: en(p.blend ?? 'Normal'),
+    hasBrushFill: !(cls === 'ContainerNode' || cls.endsWith('TextNode')), // R-22
+    brushFillDescriptor: typeof p.fill === 'string' ? solid(p.fill) : (p.fill ?? NO_FILL),
+    hasPenFill: true,
+    penFillDescriptor: p.pen ? solid(p.pen) : NO_FILL,
+    lineWeight: p.width ?? 0,
+    strokeAlignment: en('Centre'),
+    lineCap: en('Butt'),
+    lineJoin: en('Round'),
+    dashPattern: p.dash ?? [],
+    layerEffectsInterface: { effects: p.effects ?? [] },
+    tagInterface: { hasKey: (k: string) => k in tags, getValueForKey: (k: string) => tags[k] },
+    children: collection(kids),
+    ...(p.shape ? { shapeType: en(p.shape) } : {}),
+    ...(cls.endsWith('TextNode')
+      ? {
+          text,
+          story: {
+            length: points.length,
+            getText: (begin: number, length: number) => points.slice(begin, begin + length).join(''),
+            glyphAttRuns: (p.runs ?? []).map(([begin, end, familyName, traitsName, weight, isItalic, height, hex]) => ({
+              begin,
+              end,
+              glyphAtts: { font: { familyName, traitsName, weight, isItalic }, height, brushFill: solid(hex) },
+            })),
+            paragraphAttRuns: (p.paragraphs ?? []).map(([begin, end, align]) => ({ begin, end, paragraphAtts: { alignXType: en(align) } })),
+          },
+        }
+      : {}),
+  };
+  const node = new Proxy(target, {
+    set(t, k, v) {
+      log.push(String(k));
+      t[k] = v;
+      return true;
+    },
+  });
+  target.isSameNode = (o: unknown) => o === node;
+  return node;
+}
+
+export interface DocumentProps {
+  spreads: object[][];
+  current?: number | null; // null: no document open
+  selection?: object[];
+  dpi?: number;
+  fonts?: [name: string, installed: boolean][];
+  families?: [name: string, styles: [style: string, weight: number, italic: boolean][]][];
+  log?: string[];
+}
+
+/** SDK modules describing one open document built from fake nodes, plus the font list. */
+export function fakeDocument(o: DocumentProps) {
+  const log = o.log ?? [];
+  const spreads = o.spreads.map((kids, i) => {
+    const s: any = { [Symbol.toStringTag]: 'SpreadNode', spreadBaseBox: box([0, 0, 800, 600]), children: collection(kids), description: `Spread ${i}` };
+    s.isSameNode = (x: unknown) => x === s;
+    return s;
+  });
+  const doc = new Proxy(
+    {
+      title: 'Fixture',
+      path: '',
+      dpi: o.dpi ?? 72,
+      units: en('Pixel'),
+      widthPixels: 800,
+      heightPixels: 600,
+      format: en('RGBA8'),
+      isDirty: false,
+      sessionUuid: 'DOC-1',
+      history: { position: 0, size: 0 },
+      spreads: collection(spreads),
+      currentSpread: spreads[o.current ?? 0],
+      selection: { nodes: collection(o.selection ?? []), length: (o.selection ?? []).length },
+      enumerateFontNames(callback: (name: string, installed: boolean) => unknown) {
+        for (const [name, installed] of o.fonts ?? []) if (callback(name, installed)) break; // a truthy return ends it (R-25)
+      },
+    },
+    {
+      set(t: any, k, v) {
+        log.push(`document.${String(k)}`);
+        t[k] = v;
+        return true;
+      },
+    },
+  );
+  const families = (o.families ?? []).map(([name, styles]) => ({
+    name,
+    fonts: styles.map(([traitsName, weight, isItalic]) => ({ traitsName, weight, isItalic })),
+  }));
+  const current = o.current === null ? null : doc;
+  return {
+    doc,
+    log,
+    modules: {
+      '/application.js': { app: { version: 'Affinity 3.3.1.4940 Win32 (Oct  6 2026)', documents: { current, all: current ? [doc] : [] } } },
+      '/fonts.js': { FontFamily: { all: families } },
+      '/fills.js': { GradientFillType: { Conical: en('Conical'), Radial: Object.assign(en('Radial'), { value: 2 }), Elliptical: en('Elliptical'), Linear: Object.assign(en('Linear'), { value: 0 }), keys: () => [] } },
+      '/colours.js': {
+        Colour: class {
+          rgba8: unknown;
+          constructor(handle: { rgba8: unknown }) {
+            this.rgba8 = handle.rgba8;
+          }
+        },
+      },
+    },
+  };
+}

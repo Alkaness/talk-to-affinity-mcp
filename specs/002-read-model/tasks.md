@@ -1,0 +1,13 @@
+# Slice 002: Tasks
+
+Each task starts with a failing test. Unit tests live in `test/read-model.test.ts`, live tests in `test/live.test.ts`.
+
+- [x] T-201 (test support) `fakeDocument()` in `test/fake-affinity.ts`: spreads of SDK-like nodes with enum values, fills, strokes, effects, text stories with code-point positions, fonts, selection, a font enumeration that stops on a truthy return, and a log of property assignments.
+- [x] T-202 (FR-202, FR-203, FR-213, FR-214, FR-215) Walk and node description in `src/sdk.js`. Tests: path IDs counted back to front; tag IDs; a duplicated tag keeps the first node in document order, across a nested node and across spreads; every row of the type table; boxes rounded to 2 decimals; the empty-layer sentinel gives `null`; names come from `description`.
+- [x] T-203 (FR-205, FR-206, FR-207, FR-208, FR-209, FR-210, FR-212) `get_document`. Tests: document and spread fields; artboards; selection IDs including a tagged node; fonts with installed flags from a block-body enumeration; depth 1 and default depth with `childCount`; `limit` with `omitted`, `hint` and `childCount` on a cut parent; unknown spread index; no document.
+- [x] T-204 (FR-211) `get_document` with `query`: type, name and text conditions, combined conditions, any depth, `limit`.
+- [x] T-205 (FR-205, FR-216, FR-217, FR-218, FR-219, FR-220, FR-221, FR-222) `get_nodes`. Tests: order and canonical IDs for path and tag requests; parent and child count; non-default fields only; solid, gradient, none and other fills; stroke with dash and `null` stroke; text runs merged, sizes in points at 144 DPI, emoji run text, alignment per paragraph; effects with degrees; unknown IDs; no document.
+- [x] T-206 (FR-205, FR-223) `list_fonts`: total, matching count, sorting, limit, styles; works without a document.
+- [x] T-207 (FR-201, FR-204, NFR-202) Read-only and descriptions: no property assignment during any read tool; the tools are read-only (annotations and retry after an interrupted call); descriptions state the ID rule; 500 nodes at depth 1 stay below 60,000 characters.
+- [x] T-208 (all P1, NFR-201, NFR-202) Live suite against Affinity 3.3.1 under Wine: a fixture document created by the test (shapes, gradient, path, two-run text, frame text with two paragraphs, nested layers, hidden, locked, rotated, half-opacity and shadowed nodes, a tagged and a duplicated node); history, dirty flag and selection unchanged; a 144 DPI document; a document with two artboards; a 1,000-node document read within 2 s.
+- [x] T-209 Analyze: coverage command, status table in `spec.md`, roadmap status and tool contract, instructions length.

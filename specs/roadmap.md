@@ -57,8 +57,8 @@ Mechanisms:
 | `run_script` | 001 | `code`, `mutates` (default true), `timeoutMs` | `result`, `logs` |
 | `sdk_docs` | 001 | `action` list/read/search/hints, `topic`, `query`, `lines` | text snippets |
 | `render` | 001, 004 | `target` spread/selection/nodes, `spreadIndex`, `ids`, `maxSize` | image |
-| `get_document` | 002 | `depth`, `spreadIndex`, `query`, `limit` | document info, tree or matches, selection, fonts used |
-| `get_nodes` | 002 | `ids`, `detail` | geometry, fills, strokes, effects, text runs, image info |
+| `get_document` | 002 | `spreadIndex`, `depth`, `limit`, `query` | document info, spread and artboards, tree or matches, selection, fonts used |
+| `get_nodes` | 002 | `ids` | geometry, fills, strokes, effects, text runs |
 | `list_fonts` | 002 | `query`, `limit` | total count, families with faces |
 | `create_nodes` | 003, 004 | `parentId`, `nodes`, `fontFallback` | created IDs mirroring the input tree |
 | `update_nodes` | 003 | `updates` | result per node |
@@ -74,9 +74,9 @@ Mechanisms:
 |---|---|---|
 | 000 | Environment spike: facts R-01 to R-18 | Done (2026-10-14) |
 | 001 | Foundation: connection layer, `get_status`, `run_script`, `sdk_docs`, `render` | Done (2026-10-14): 38 unit and 14 live tests pass |
-| 002 | Read model: `get_document`, `get_nodes`, `list_fonts` | Not started |
+| 002 | Read model: `get_document`, `get_nodes`, `list_fonts`; facts R-19 to R-31 | Done (2026-10-14): 57 unit and 23 live tests pass |
 | 003 | Write model: `create_nodes`, `update_nodes`, `delete_nodes`, `undo` | Not started |
-| 004 | Files and export: `manage_document`, `export`, high-resolution `render`, image nodes | Not started |
+| 004 | Files and export: `manage_document`, `export`, high-resolution `render`, `render` of chosen nodes, image nodes | Not started |
 | 005 | Visual compare: `compare_to_reference` | Not started |
 | 006 | Release: README, CHANGELOG, package dry run, version 0.1.0 | Not started |
 
@@ -109,7 +109,7 @@ Probes in `spike/` answer the questions below and record the answers in `specs/0
 The key requirements of each slice are listed in the approved plan and become the starting point of the slice's `spec.md`:
 
 1. 001 foundation: FR-101 to FR-109 (connect and preamble, unreachable error within 3 s, host fallback, reconnect and retry rules, timeout honesty, result and logs, docs search cap of 20 snippets, image content, MCP instructions under 1,500 characters).
-2. 002 read model: FR-201 to FR-206 (reads never mutate, ID rules, truncation, boxes in document pixels, text runs, font count).
+2. 002 read model: FR-201 to FR-223 (reads never mutate, ID rules, compact tree with truncation, queries, boxes in document pixels, fills, strokes, effects, text runs, font list).
 3. 003 write model: FR-301 to FR-307 (one undo step, schema rejection before execution, no partial changes, tagged IDs mirroring input, explicit font failure with 5 suggestions, SVG path data including arcs, automatic spread switch).
 4. 004 files and export: FR-401 to FR-405 (export through staging, permission error, copy-on-open outside the sandbox, guarded close, high-resolution render).
 5. 005 visual compare: FR-501 to FR-505 (score, diff ratio, 5 worst regions, heatmap; aspect-ratio guard; regions in document pixels; fixture tests; JPEG-aware threshold).

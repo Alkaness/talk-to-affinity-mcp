@@ -145,3 +145,92 @@ The probes were removed after slice 001 (they remain in commit 84ac2a2). Each en
 
 1. When the first SSE connection fails, the SDK's `SSEClientTransport` keeps its EventSource retrying, which keeps the Node process alive indefinitely.
 2. Consequence: on any failed connect the server closes the transport explicitly (slice 001 requirement).
+
+## 6. Slice 002 facts (2026-10-14, same build)
+
+Measured with a fixture document (shapes, a path, two text nodes, a nested layer, hidden, locked, rotated, half-opacity and shadowed nodes) and probes run through the server's own `Upstream`. The probe scripts were not kept; the snippets below are the evidence.
+
+### R-19 Node classes and names
+
+1. `String(node)` gives the class: `ShapeNode`, `PolyCurveNode`, `ArtTextNode`, `FrameTextNode`, `ContainerNode`, `GroupNode`, `ImageNode`, `RasterNode`, 49 adjustment and live-filter classes ending in `AdjustmentRasterNode` or `FilterRasterNode`, `SpreadNode`, `MeasurementNode`, `EmbeddedDocumentNode`, and the text variants `CurvePathTextNode`, `PolyCurveTextNode`, `ShapePathTextNode`, `TableTextNode`, `ShapeTextNode`.
+2. `node.shapeType` names the shape (`Rectangle`, `Ellipse`, `Star`, ...).
+3. `node.description` is the user name when set (`userDescription`), otherwise the default name: `Rectangle`, `Ellipse`, `Circle` (an ellipse with equal sides), `Star`, `Poly Line`, `Layer`, or the text content cut at 25 characters.
+4. An artboard is a top-level `ShapeNode` with `isArtboardEnabled` true; `spread.artboards` yields `ArtboardInterface` objects whose `.node` is that shape. Adding artboards resized the document to their union (1,000 x 600 px became 800 x 300 px).
+
+### R-20 Child order
+
+1. `children` iterates from back to front: of two overlapping rectangles inserted in one builder, the second covers the first in the render.
+
+### R-21 Geometry
+
+1. `spreadBaseBox` is the geometric box; `spreadVisibleBox` includes the stroke (a 120 x 80 ellipse with a 4 px centred stroke: base 120 x 80, visible 124 x 84).
+2. `node.transform.decompose()` returns `rotation` (radians), `scaleX`, `scaleY`, `shear`, `translateX`, `translateY`. A rotated node reports its axis-aligned bounding box.
+3. `doc.applyTransform(Transform.createRotate(a), selection)` rotates about the spread origin, not the node centre.
+4. A layer whose only child is hidden reports the box `{x: -1.7976931348623157e+308, y: -1.7976931348623157e+308, width: 0, height: 0}`.
+
+### R-22 Fill and stroke
+
+1. `brushFillDescriptor.fill` is `SolidFill` (`colour.rgba8`), `GradientFill` or `NoFill`; `fillType` inspects as `Solid`, `Gradient`, `None`.
+2. Gradient stops (`fill.gradient.stops`) carry `position`, `midpoint` and a raw colour handle that `new Colour(handle)` wraps. `gradientFillType` inspects as a number (0 for linear).
+3. `penFillDescriptor`, `lineWeight` (pixels), `lineWeightPts`, `strokeAlignment` (`Centre`), `lineCap` (`Butt`), `lineJoin` (`Round`), `dashPattern` describe the stroke. Shapes without a stroke have a `NoFill` pen and weight 0.
+4. Text nodes report `hasBrushFill` false; their colour lives in the text runs (R-24).
+5. `globalOpacity` (0.5 after `doc.setOpacity(0.5, ...)`), `blendMode` (`Multiply`), `isVisible`, `isLocked` read back as set.
+6. Enum values print their names through `require('/inspect.js').inspect(value)`.
+
+### R-23 Layer effects
+
+1. `node.layerEffectsInterface.effects` lists typed effects. An enabled outer shadow read back as type `OuterShadow`, `enabled` true, `opacity` 0.5, `blendMode` `Multiply`, `radius` 0, colour black, `offset` 0, `angle` 0.785 rad, `intensity` 0.
+
+### R-24 Text
+
+1. `node.text` is the content. `node.story.glyphAttRuns` yields `{glyphAtts, begin, end}`; `glyphAtts.font` gives `familyName`, `traitsName`, `weight` (number), `isItalic`; `glyphAtts.height` is the size in document pixels (36 at 72 DPI for a 36 pt request); `glyphAtts.brushFill` is the colour. `story.paragraphAttRuns` gives `alignXType` (`Left`).
+2. A requested face that does not exist falls back silently: `DejaVu Serif` italic was requested, the family has only `Book` and `Bold`, and the run reports `Book`, not italic.
+3. `TextFrameInterface` has no overflow getter.
+
+### R-25 Fonts
+
+1. `FontFamily.all` lists 268 families; `family.fonts` gives each face's `traitsName`, `weight`, `isItalic`, `width` and `postscriptName` (Arial: Regular 400, Italic 400, Bold 700, Bold Italic 700).
+2. `doc.enumerateFontNames((name, installed) => { ... })` lists the PostScript names the document uses with an installed flag. A callback that returns a truthy value ended the enumeration after the first name; a callback with a block body listed all three.
+
+### R-26 Reads do not mutate
+
+1. Reading every property above for 15 nodes, the font lists and the selection left `history.position`, `history.size` and `isDirty` unchanged (35, 35, true before and after).
+
+### R-27 Selection
+
+1. `doc.selection.nodes` lists the selected nodes; the last inserted node stays selected after a builder command with `andSelect` true.
+2. `DocumentCommand.createSetSelection(Selection.create(doc, nodes))` adds one undo step per change and marks the document dirty.
+3. Consequence: read tools never change the selection; rendering chosen nodes needs an export area built from a `Selection` object (slice 004).
+
+### R-28 Facts for the write model (slice 003)
+
+1. No script API creates a `GroupNode`: `GroupNodeDefinition` has no constructor method and no command groups nodes. `ContainerNodeDefinition.create(name)` creates layers.
+2. `PolyCurveNodeDefinition.create(curve, brushFill, lineFill, lineStyle, transparencyFill)` needs explicit `FillDescriptor` and `LineStyleDescriptor` arguments; `ShapeNodeDefinition.create` wraps a `Colour` but needs a `LineStyleDescriptor` (not a `LineStyle`) for the stroke. `CurveBuilder` uses `beginXY`, `lineToXY`, `addBezier`, `close`.
+3. A gradient fill built with an identity transform renders as its end colour; gradients need a transform that spans the shape.
+
+### R-29 Document properties and enum names
+
+1. `doc.title` (`<Untitled>` for a new document), `doc.path` (empty until saved), `doc.dpi`, `doc.units`, `doc.widthPixels`, `doc.heightPixels`, `doc.format` and `doc.isDirty` describe the document; a new 800 x 600 px document at 72 DPI read back as units `Pixel`, format `RGBA8`.
+2. SDK enum values carry an `isEnumValue` marker and stringify to their key name (`inspect.js`, `tryFormatEnumValue`): `String(node.blendMode)` is `Normal`, `String(node.shapeType)` is `Rectangle`, `String(doc.units)` is `Pixel`.
+3. `fill.gradientFillType` is a plain number, not an enum value: 2 for a radial gradient. The enum `GradientFillType` from `/fills.js` has the keys `Linear` (`.value` 0), `Radial` (2), `Elliptical` and `Conical`, so the name is found by matching `.value`.
+
+### R-30 Units and text positions
+
+Measured in a 400 x 300 px document at 144 DPI.
+
+1. A stroke created with weight 4 reads `lineWeight` 4 and `lineWeightPts` 2: `lineWeight` is in document pixels.
+2. Artistic text in the default style (12 pt) reads `glyphAtts.height` 24: text height is in document pixels, so points = height x 72 / DPI.
+3. Story positions count code points, not UTF-16 units: the text `A🎨Bé` has JavaScript length 5 and story length 4. `story.getText(begin, length)` returns the exact text of a run. The emoji formed its own run, because it is drawn with a fallback font.
+4. A paragraph break appears as `\n` in `node.text`. `story.paragraphAttRuns` merges consecutive paragraphs with identical attributes: two left-aligned paragraphs form one run.
+5. `node.dashPattern` is an array: `[]` without dashes, `[3, 1]` after `doc.setDashPattern([3, 1], ...)`.
+6. A top-level node's `parent` is the `SpreadNode`; a spread's `parent` is the `DocumentNode`. `previousSibling` moves towards the back (index 0).
+
+### R-31 Cost of a full read
+
+Measured in a document with 1,000 rectangles on one spread, all selected.
+
+1. A walk over every node that checks `tagInterface.hasKey` takes 51 ms.
+2. `doc.selection.nodes.toArray()` returns the 1,000 nodes in 4 ms, in document order for this document.
+3. 10,000 `isSameNode` calls take 1 ms. `node.handle` is a new `ShapeNodeHandle` object on every access, so node identity needs `isSameNode`.
+4. Reading class, description, base box, visibility, lock, shape type, artboard flag and child count for 500 nodes takes 58 ms.
+5. Consequence: a read tool can walk the whole document once per call (tags, selection, output) and still meet NFR-201.
