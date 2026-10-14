@@ -1,0 +1,179 @@
+[
+  {
+    "name": "add_sdk_hint",
+    "description": "Add a hint to the preamble document so future sessions can be more efficient.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "hint": {
+          "type": "string",
+          "description": "The hint to add to the preamble."
+        }
+      },
+      "required": [
+        "hint"
+      ]
+    }
+  },
+  {
+    "name": "execute_script",
+    "description": "Execute Javascript and return the results. You MUST read the 'preamble' documentation before using this tool.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "script": {
+          "type": "string",
+          "description": "The Javascript to execute"
+        }
+      },
+      "required": [
+        "script"
+      ]
+    }
+  },
+  {
+    "name": "list_library_scripts",
+    "description": "List the names of the scripts in the script library.",
+    "inputSchema": {
+      "type": "object"
+    }
+  },
+  {
+    "name": "list_sdk_documentation",
+    "description": "List SDK documentation topics.",
+    "inputSchema": {
+      "type": "object"
+    }
+  },
+  {
+    "name": "read_library_script",
+    "description": "Read a script from the script library.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "title": {
+          "type": "string",
+          "description": "The title of the script to read."
+        }
+      },
+      "required": [
+        "title"
+      ]
+    }
+  },
+  {
+    "name": "read_sdk_documentation_topic",
+    "description": "Read SDK documentation topic. You MUST run this tool with the 'preamble' file before any other files.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "filename": {
+          "type": "string",
+          "description": "The SDK documentation filename from list_sdk_documentation"
+        }
+      },
+      "required": [
+        "filename"
+      ]
+    }
+  },
+  {
+    "name": "render_selection",
+    "description": "Render the currently selected nodes to a base64 encoded JPEG. The JPEG has a maximum dimension of 1024px, so may be downscaled.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "document_session_uuid": {
+          "type": "string",
+          "description": "The session Uuid of the document to render."
+        }
+      },
+      "required": [
+        "document_session_uuid"
+      ]
+    }
+  },
+  {
+    "name": "render_spread",
+    "description": "Render a spread to a base64 encoded JPEG. The JPEG has a maximum dimension of 1024px, so may be downscaled.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "document_session_uuid": {
+          "type": "string",
+          "description": "The session Uuid of the document to render."
+        },
+        "spread_index": {
+          "type": "number",
+          "description": "The zero-based index of the spread to render."
+        }
+      },
+      "required": [
+        "document_session_uuid",
+        "spread_index"
+      ]
+    }
+  },
+  {
+    "name": "report_sdk_issue",
+    "description": "Report an issue with the SDK to the Affinity. Be sure the issue is real before reporting.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "description": {
+          "type": "string",
+          "description": "A description of the SDK issue"
+        },
+        "code": {
+          "type": "string",
+          "description": "JavaScript demonstrating the issue, if appropriate"
+        }
+      },
+      "required": [
+        "description"
+      ]
+    }
+  },
+  {
+    "name": "save_script_to_library",
+    "description": "Completed scripts can be saved to the Affinity script library for use later on.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "title": {
+          "type": "string",
+          "description": "The title of the script"
+        },
+        "description": {
+          "type": "string",
+          "description": "A brief description of the script"
+        },
+        "code": {
+          "type": "string",
+          "description": "The JavaScript itself"
+        }
+      },
+      "required": [
+        "title",
+        "description",
+        "code"
+      ]
+    }
+  },
+  {
+    "name": "search_sdk_hints",
+    "description": "Search a global pool of SDK hints from millions of other MCP sessions. Use it to check for existing solutions to problems you are facing.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "prompt": {
+          "type": "string",
+          "description": "A prompt describing the issue you are facing."
+        }
+      },
+      "required": [
+        "prompt"
+      ]
+    }
+  }
+]
