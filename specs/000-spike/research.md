@@ -2,7 +2,7 @@
 
 Measured on 2026-10-14 against Affinity 3.3.1.4940 (`Affinity 3.3.1.4940 Win32 (Oct  6 2026)`), running under Wine through the AppImage `Affinity-Infinity-x86_64.AppImage` on Linux. Client: `@modelcontextprotocol/sdk` 1.32.1 on Node 22.19.0. Probes: `spike/probe.mjs` and `spike/r*.js`. Verbatim tool list: `specs/000-spike/native-tools.json`.
 
-Each entry states the answer, the evidence, and the consequence for the design.
+The probes were removed after slice 001 (they remain in commit 84ac2a2). Each entry states the answer, the evidence, and the consequence for the design.
 
 ## 1. Endpoint and protocol
 
@@ -31,7 +31,8 @@ Each entry states the answer, the evidence, and the consequence for the design.
 
 1. A session left idle for 300 s still works: the next `execute_script` returns in 9 ms. No server-side idle timeout was observed.
 2. Session death was not reproduced in this slice; the community report of HTTP 404 on the message URL after long sessions remains unconfirmed. A restart of Affinity ends every session.
-3. Consequence: the server keeps one session open and reconnects when a call fails with a closed stream or HTTP 404 (FR-105).
+3. The endpoint event carries `/message?session_id=<uuid>`. A POST for an unknown session ID returns HTTP 404, so a request sent on a lost session is refused before any script runs.
+4. Consequence: the server keeps one session open and reconnects when a call fails with a closed stream or HTTP 404 (FR-105); a 404 means the request was not delivered, so it is safe to repeat.
 
 ### R-12 Concurrent sessions
 
@@ -137,7 +138,8 @@ Each entry states the answer, the evidence, and the consequence for the design.
 2. Reads are unreliable under Wine: in 2 of 9 sessions the preamble read returned 3,798 characters; in the other 7, and in every later session, `read_sdk_documentation_topic` returned `isError: true` "File not found" and `list_sdk_documentation` returned `isError: true` "Listing failed.".
 3. The native topic list has 143 entries. The SDK module sources ship with Affinity in `Resources\JSLib\` (69 entries, including `examples` and `tests`), the module root for `require`; only `preamble` and the three range files (`param_ranges.min.json`, `struct_ranges.min.json`, `struct_array_sizes.min.json`) exist solely in the download. Each fetch writes the topic to a new file name in the cache.
 4. Two `Affinity.exe` processes were running during these measurements (started 16:01:56 and 16:14:02). The second start rewrote the download cache index. The flaky reads may come from that; it is not confirmed.
-5. Consequence: `sdk_docs` uses the native topics when they load and falls back to the local `JSLib` folder when they fail. The server never depends on documentation for its own tools.
+5. The `JSLib` sources carry a BSD 3-Clause license, copyright Canva Pty Ltd. SDK objects derive from `HandleObject`, which keeps its native handle in a private field, so they have no own enumerable properties.
+6. Consequence: `sdk_docs` uses the native topics when they load and falls back to the local `JSLib` folder when they fail. The server never depends on documentation for its own tools.
 
 ### R-18 Client-side connection leak
 

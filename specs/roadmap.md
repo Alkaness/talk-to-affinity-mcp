@@ -73,7 +73,7 @@ Mechanisms:
 | Slice | Content | Status |
 |---|---|---|
 | 000 | Environment spike: facts R-01 to R-18 | Done (2026-10-14) |
-| 001 | Foundation: connection layer, `get_status`, `run_script`, `sdk_docs`, `render` | In progress (spec approved 2026-10-14) |
+| 001 | Foundation: connection layer, `get_status`, `run_script`, `sdk_docs`, `render` | Done (2026-10-14): 38 unit and 14 live tests pass |
 | 002 | Read model: `get_document`, `get_nodes`, `list_fonts` | Not started |
 | 003 | Write model: `create_nodes`, `update_nodes`, `delete_nodes`, `undo` | Not started |
 | 004 | Files and export: `manage_document`, `export`, high-resolution `render`, image nodes | Not started |

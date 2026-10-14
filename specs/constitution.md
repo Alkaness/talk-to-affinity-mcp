@@ -54,8 +54,8 @@ Each requirement has a priority: P1 (slice fails without it), P2 (expected), P3 
 ### 2.4 Traceability
 
 1. Test names start with the requirement ID: `test('FR-301 create_nodes is one undo step', ...)`.
-2. Coverage check, run at G4 from the repository root; it prints nothing when every requirement has a test:
-   `comm -23 <(grep -rhoE '\b(N?FR)-[0-9]+' specs | sort -u) <(grep -rhoE '\b(N?FR)-[0-9]+' test | sort -u)`
+2. Coverage check, run at G4 from the repository root with the slice's folder; it prints nothing when every requirement of that slice has a test:
+   `comm -23 <(grep -hoE '\b(N?FR)-[0-9]+' specs/<slice>/spec.md | sort -u) <(grep -rhoE '\b(N?FR)-[0-9]+' test | sort -u)`
 3. A behavior change edits the spec in the same commit.
 
 ### 2.5 Artifact skeletons
@@ -105,4 +105,4 @@ The owner approves every `spec.md` (gate G1) and every commit. Plans, tasks, cod
 
 ## 7. Amendments
 
-None.
+1. 2026-10-14: the coverage check in section 2.4 is scoped to one slice's `spec.md`. Reason: the roadmap names requirements of future slices, which have no tests yet.
