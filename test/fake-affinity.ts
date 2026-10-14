@@ -216,6 +216,9 @@ export interface NodeProps {
   pen?: string;
   width?: number;
   dash?: number[];
+  lineType?: string; // default: Dash when dash is given, else Solid
+  scale?: number; // uniform node scale
+  noBrush?: boolean; // an unfilled shape: hasBrushFill is false (R-44)
   hidden?: boolean;
   locked?: boolean;
   artboard?: boolean;
@@ -241,11 +244,14 @@ export function fakeNode(cls: string, p: NodeProps = {}, kids: object[] = [], lo
     isVisible: !p.hidden,
     isLocked: !!p.locked,
     isArtboardEnabled: !!p.artboard,
-    transform: { decompose: () => ({ rotation: p.rotation ?? 0, scaleX: 1, scaleY: 1, shear: 0, translateX: 0, translateY: 0 }) },
+    transform: { decompose: () => ({ rotation: p.rotation ?? 0, scaleX: p.scale ?? 1, scaleY: p.scale ?? 1, shear: 0, translateX: 0, translateY: 0 }) },
     globalOpacity: p.opacity ?? 1,
     blendMode: en(p.blend ?? 'Normal'),
-    hasBrushFill: !(cls === 'ContainerNode' || cls.endsWith('TextNode')), // R-22
-    brushFillDescriptor: typeof p.fill === 'string' ? solid(p.fill) : (p.fill ?? NO_FILL),
+    hasBrushFill: !(p.noBrush || cls === 'ContainerNode' || cls.endsWith('TextNode')), // R-22, R-44
+    get brushFillDescriptor() {
+      if (!this.hasBrushFill) throw new Error('read brushFillDescriptor of a node without a brush fill (R-44: this crashed Affinity)');
+      return typeof p.fill === 'string' ? solid(p.fill) : (p.fill ?? NO_FILL);
+    },
     hasPenFill: true,
     penFillDescriptor: p.pen ? solid(p.pen) : NO_FILL,
     lineWeight: p.width ?? 0,
@@ -253,6 +259,7 @@ export function fakeNode(cls: string, p: NodeProps = {}, kids: object[] = [], lo
     lineCap: en('Butt'),
     lineJoin: en('Round'),
     dashPattern: p.dash ?? [],
+    lineType: en(p.lineType ?? (p.dash?.length ? 'Dash' : 'Solid')),
     layerEffectsInterface: { effects: p.effects ?? [] },
     tagInterface: { hasKey: (k: string) => k in tags, getValueForKey: (k: string) => tags[k] },
     children: collection(kids),

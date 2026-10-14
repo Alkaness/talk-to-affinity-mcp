@@ -60,10 +60,10 @@ Mechanisms:
 | `get_document` | 002 | `spreadIndex`, `depth`, `limit`, `query` | document info, spread and artboards, tree or matches, selection, fonts used |
 | `get_nodes` | 002 | `ids` | geometry, fills, strokes, effects, text runs |
 | `list_fonts` | 002 | `query`, `limit` | total count, families with faces |
-| `create_nodes` | 003, 004 | `parentId`, `nodes`, `fontFallback` | created IDs mirroring the input tree |
-| `update_nodes` | 003 | `updates` | result per node |
-| `delete_nodes` | 003 | `ids` | count |
-| `undo` | 003 | `steps`, `redo` | history state |
+| `create_nodes` | 003, 004 | `nodes` (rect, ellipse, star, shape, path, text, layer), `parentId`, `spreadIndex`, `fontFallback` | created IDs mirroring the input tree, undo steps |
+| `update_nodes` | 003 | `updates` [{`id`, `set`, `move`}], `fontFallback` | IDs per node, undo steps |
+| `delete_nodes` | 003 | `ids` | count, undo steps |
+| `undo` | 003 | `steps`, `redo` | steps done, history position and size, next descriptions |
 | `manage_document` | 004 | `action` create/open/save/saveAs/close | document info |
 | `export` | 004 | `target`, `ids`, `format`, `scale` or `dpi`, `path` | path, bytes |
 | `compare_to_reference` | 005 | `reference`, `target`, `ids`, `maxSize`, `threshold`, `fit` | score, diff ratio, worst regions, heatmap image |
@@ -75,7 +75,7 @@ Mechanisms:
 | 000 | Environment spike: facts R-01 to R-18 | Done (2026-10-14) |
 | 001 | Foundation: connection layer, `get_status`, `run_script`, `sdk_docs`, `render` | Done (2026-10-14): 38 unit and 14 live tests pass |
 | 002 | Read model: `get_document`, `get_nodes`, `list_fonts`; facts R-19 to R-31 | Done (2026-10-14): 57 unit and 23 live tests pass |
-| 003 | Write model: `create_nodes`, `update_nodes`, `delete_nodes`, `undo` | Not started |
+| 003 | Write model: `create_nodes`, `update_nodes`, `delete_nodes`, `undo`; facts R-32 to R-45 | Done (2026-10-14): 20 unit and 11 live tests pass |
 | 004 | Files and export: `manage_document`, `export`, high-resolution `render`, `render` of chosen nodes, image nodes | Not started |
 | 005 | Visual compare: `compare_to_reference` | Not started |
 | 006 | Release: README, CHANGELOG, package dry run, version 0.1.0 | Not started |

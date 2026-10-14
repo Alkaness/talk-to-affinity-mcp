@@ -234,3 +234,99 @@ Measured in a document with 1,000 rectangles on one spread, all selected.
 3. 10,000 `isSameNode` calls take 1 ms. `node.handle` is a new `ShapeNodeHandle` object on every access, so node identity needs `isSameNode`.
 4. Reading class, description, base box, visibility, lock, shape type, artboard flag and child count for 500 nodes takes 58 ms.
 5. Consequence: a read tool can walk the whole document once per call (tags, selection, output) and still meet NFR-201.
+
+## 7. Slice 003 facts (2026-10-14, same build)
+
+Measured with probe scripts run through the server's own `Upstream`; each probe created its own documents and closed them.
+
+### R-32 Insertion inside one compound command
+
+1. `InsertionMode` keys: `Default` 0, `Inside_AtBack` 1, `Inside_AtFront` 2, `Behind` 3, `Top` 4.
+2. With an explicit insertion target, `Default` and `Inside_AtBack` append at the end of the target's children (the front of the z-order), `Inside_AtFront` inserts at index 0 (the back), and `Behind` and `Top` fail with `INVALID_ARGS`.
+3. Without a target, insertion is relative to the current selection: a selected empty layer receives the node inside it; a selected shape gets the node as the sibling above it (`Default`, `Top`) or below it (`Behind`); `Inside_AtFront` and `Inside_AtBack` put it inside the selected node even when that is a shape.
+4. One `CompoundCommandBuilder` holding `[AddChildNodes(andSelect = true), SetTagValueForKey(null, ...)]` pairs for several nodes executes as 1 undo step, and each tag lands on its own node. This also holds for a new layer followed by children inserted relative to the selection.
+5. A node created earlier in the same compound command can be reached only through the selection, and the selection cannot return to an intermediate created level. A created tree with branching below its second level therefore needs more than one command.
+6. `NodeDefinition` has `userDescription` and `transform`, so names and rotations can be set before insertion.
+
+### R-33 Updates, transforms, deletion and history
+
+1. One compound command holding brush fill, pen fill, opacity, blend mode, description, visibility, `createSetEditable(false)` (locks), transform and tag commands for three nodes executes as 1 undo step; each change reads back as set (opacity 0.4 reads 0.4000000059604645).
+2. `createSetLineStyle` with a `LineStyle` of weight 3, cap `Round`, join `Bevel` and dash `[4, 2]` did not change the stroke, with or without `lineStyleMask: LineStyleMask.All` (262143); `createSetStrokeAlignment` did. Resolved in R-37.
+3. `TransformBuilder` applies operations in call order: `translateXY(-cx, -cy).rotate(a).translateXY(cx, cy)` rotates about `(cx, cy)`; a rectangle centred at (150, 120) kept its centre after a 30-degree rotation, also when the transform was set on the definition before insertion. A scale transform resized a box exactly to `[20, 30, 200, 25]`, kept the stroke weight of 4 px and left scale (2, 0.5) in the node transform.
+4. `createDeleteSelection` is 1 undo step named "Delete"; `doc.undo()` and `doc.redo()` move through the history; after a redo `canRedo` is false and `redoDescription` is "Unknown".
+
+### R-34 Layer effects
+
+1. `OuterShadowLayerEffect`, `InnerShadowLayerEffect`, `OuterGlowLayerEffect` and `GaussianBlurLayerEffect` objects from `create()`, set through the matching `createSet...LayerEffect` commands (with index 0 where the command takes one) in one compound command: 1 undo step. They read back in the fixed order inner shadow, outer glow, outer shadow, Gaussian blur, with the values set. Defaults: inner shadow opacity 0.5, black, angle 45 degrees; outer glow white, intensity 0.5.
+2. `createRemoveAllLayerEffects` is 1 undo step.
+
+### R-35 Order and spreads
+
+1. `NodeMoveType`: `Before` 0, `After` 1, `Inside` 2. `createMoveNodes(selection, target, After)` moved a node in front of the target; `Inside` moved it into a layer.
+2. `NewDocumentOptions` with `isMultiPage` true, `isFacing` false and `pageCount` 2 creates 2 spreads; `pageCount` alone gave 1.
+3. `createSetCurrentSpread` is an undoable command (1 step). Adding a node to a non-current spread through an explicit target works without switching (1 step; the current spread stays).
+
+### R-36 Text, shapes and paths
+
+1. A family unknown to `StoryDelta.createFamilyName` stays as the run's `familyName`, with `traitsName` empty, and is drawn with a fallback. `StoryDelta.createPostscriptName('Georgia-Bold')` selects the exact face (family Georgia, style Bold).
+2. `StoryBuilder.applyParagraphDelta(StoryDelta.createAlignX(...))` sets the alignment per paragraph; `ParagraphAlignXType` keys: `Left`, `Centre`, `Right`, `JustifyLeft`, `JustifyCentre`, `JustifyRight`, `JustifyAll`, `TowardsSpine`, `AwayFromSpine`. `createFormatText(selection, delta)` restyles the whole text in 1 step.
+3. `createSetText(selection, text)` appended the text instead of replacing it. The SDK examples select a text range with `selection.addSubSelectionForNode(node, TextSelection.create(node.storyRange))`; confirmed in R-38.
+4. `ShapeStar` `points` and `innerRadius` (a ratio, default 0.382) and `ShapePolygon` `sides` apply at creation; `createSetShape` changes them in 1 step. Rectangle corners set with `corner.setRadius(10, width, height)` stayed at radius 0 in both `absoluteSizes` modes; the corner type has to be set too (R-39).
+5. A `PolyCurve` takes several curves (subpaths); `CurveBuilder` offers `beginXY`, `lineToXY`, `addBezierXY` and `close`; an open curve with only a pen fill works. `WindingOrder`: `OddEven` 0, `NonZero` 1; `createSetWindingMode` is 1 undo step.
+
+### R-37 Stroke updates and line types
+
+1. `createSetLineStyle` applies the fields named by `lineStyleMask` when the mask is one `LineStyleMask` value (`Weight`) or a numeric OR of values (`Weight` 256, `Cap` 8, `Join` 16, `DashPattern` 64, `Type` 1): weight 3, cap Round, join Bevel and dash [4, 2] all applied. `LineStyleMask.All` (262143) and `createSetLineStyleDescriptor` with `All` changed nothing. One compound command with one masked command per field also applies all fields, as 1 undo step.
+2. `LineType`: `None` 0, `Solid` 1, `Dash` 2, `Texture` 3. A dash pattern draws dashes only with type `Dash` (rendered): pattern [4, 2] on a `Solid` line drew a solid line. Dash lengths scale with the stroke width: pattern [4, 2] at width 4 drew dashes about 16 px long with gaps of about 8 px.
+3. `LineStyle.create(options)` defaults to cap Round, join Round and dash pattern [1, 1] on a `Solid` line. `LineStyle.createDefaultWithWeight(w)` has an empty pattern, cap Butt and join Round, and its `cap`, `join`, `type` and `dashPattern` setters take effect when the style is used at creation. `LineStyleDescriptor.create(lineStyle, {strokeAlignment})` sets the alignment (`Inside`, `Centre`, `Outside`). `LineCap`: `Butt`, `Round`, `Square`; `LineJoin`: `Miter`, `Round`, `Bevel`, `MiterLegacy`.
+
+### R-38 Text editing
+
+1. `createSetText(selection, text)` replaces the whole text when the selection carries a `TextSelection` over `node.storyRange`; 1 undo step. Without that sub-selection it appends.
+2. One compound command holding that replacement and then `createFormatText` commands on `TextSelection.create([{begin, end}])` ranges, counted in code points, restyled each range as given (Arial Bold 40 px, Georgia Regular 16 px): 1 undo step.
+3. A transform that scales a text node by 2 doubles its box and leaves `glyphAtts.height` unchanged; the node transform then carries scale 2. Frame text behaves the same way, and no API was found that resizes a text frame without scaling its text (`TextFrameInterface` exposes `hasScaledText` and `textRenderScale` only).
+4. Consequence: the size drawn is `height x 72 / DPI x` the node's vertical scale.
+
+### R-39 Rectangle corners
+
+1. `ShapeCornerType`: `Round` 0, `Straight` 1, `RoundInverse` 2, `Cutout` 3, `None` 4. With every corner's `cornerType` set to `Round` and `setAbsoluteSizes(true, w, h)`, `corner.setRadius(10, w, h)` gives a 10 px radius at creation; with absolute sizes off the radius is relative and read back as 0.5. Without the corner type the radius stays 0.
+
+### R-40 Gradient fill transforms
+
+Rendered with `render_spread` and inspected.
+
+1. A gradient's transform maps its unit space onto the spread. A linear gradient runs from unit x = 0 (first stop) to x = 1 (last stop): with `new Transform(w, 0, x, 0, h, y)` it runs left to right across the box.
+2. Radial and elliptical gradients are centred at the unit origin with radius 1: `new Transform(w / 2, 0, x + w / 2, 0, h / 2, y + h / 2)` centres an ellipse in the box that reaches its sides.
+3. For a page angle `a` (0 degrees left to right, 90 degrees top to bottom), the transform `(L cos a, -L sin a, cx - L/2 cos a, L sin a, L cos a, cy - L/2 sin a)` with `L = |w cos a| + |h sin a|` and box centre `(cx, cy)` runs the gradient through the centre across the whole box; checked at 0, 45, 90 and 180 degrees.
+4. `PolyCurve.boundingBox` gives exact curve bounds: a cubic from (0, 0) to (100, 0) with control points at y = 100 spans y 0 to 75.
+
+### R-41 Failures, tags and size
+
+1. After a script executed two commands and then threw, undoing back to the recorded history position restored the document tree. The undone steps remain as redo steps (`canRedo` true, history size unchanged).
+2. Setting the `ttam-id` tag on a tagged node replaces its value.
+3. 300 nodes, each inserted with an explicit target and tagged, in one compound command: 43 ms and 1 undo step.
+
+### R-42 Selection-relative settings, locked nodes and spreads
+
+1. Inside a compound command, `createSetOpacity`, `createSetBlendMode`, `createSet...LayerEffect`, `createSetWindingMode`, `createSetVisibility` and `createSetEditable` with a null selection apply to the node just inserted with `andSelect` true; a following insertion with an explicit target is not affected.
+2. `createSetEditable(false)` deselects the node: a later null-selection `createSetVisibility` in the same compound did not reach it. Hiding first and locking second applied both.
+3. With a new empty layer selected, the next relative insertion goes inside it in every mode (`Default`, `Top`, `Behind`). Default insertion after a selected shape, text or path node adds the next node as its sibling in front.
+4. Commands with explicit selections edit locked nodes: fill, transform, name, visibility and deletion all applied.
+5. Editing a node on a spread that is not current fails with `COMMAND_FAILED`; inserting into it works (R-35). A compound command that starts with `createSetCurrentSpread(spread)` and then edits or deletes the node executes as 1 undo step and leaves that spread current.
+
+### R-43 Names and text placement
+
+1. Shape type names equal the class name without `Shape`: `Arrow`, `CalloutEllipse`, `CalloutRectangle`, `Cat`, `Cat2`, `Cat3`, `Cat4`, `Cloud`, `Cog`, `Crescent`, `Diamond`, `DoubleStar`, `Ellipse`, `Heart`, `Pie`, `Polygon`, `QRCode`, `Rectangle`, `Segment`, `Spiral`, `SquareStar`, `Star`, `Tear`, `Trapezoid`, `Triangle`.
+2. `BlendMode` has 33 keys: `Normal`, `Darken`, `Multiply`, `ColourBurn`, `LinearBurn`, `DarkerColour`, `Lighten`, `Screen`, `ColourDodge`, `Add`, `LighterColour`, `Overlay`, `SoftLight`, `HardLight`, `VividLight`, `LinearLight`, `PinLight`, `HardMix`, `Difference`, `Exclusion`, `Subtract`, `Divide`, `Hue`, `Saturation`, `Colour`, `Luminosity`, `Average`, `Negation`, `Reflect`, `Glow`, `ContrastInvert`, `Erase`, `Pigment`.
+3. Art text created at `{x, y}` starts its first baseline there: the slice 002 fixture placed "Hello World" at (20, 200) and its glyph box ends at y 200.42; text with a descender placed at y 100 ends at 104.33.
+
+### R-44 Unfilled shapes
+
+1. A shape created with `FillDescriptor.createNone()` as its brush reports `hasBrushFill` false; `hasPenFill` stays true without a stroke (weight 0).
+2. A probe that read `brushFillDescriptor` of such a node lost its connection, and Affinity had to be restarted; the same probe without that read ran normally. The library reads a descriptor only when the matching `has...Fill` holds.
+3. Consequence: whether a fill applies is decided by the node type, not by `hasBrushFill`.
+
+### R-45 History items
+
+1. `history.getItem(i).description` is the description of step `i`, counted from 0: at position `p` the next undo is item `p - 1` and the next redo is item `p`. After an undo, a description can lose its detail ("Delete b" became "Delete").
+2. `undoDescription` and `redoDescription` throw `INVALID_OP` at position 0, even while `canRedo` holds.

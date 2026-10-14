@@ -2,10 +2,12 @@
 // src/affinity.ts fills in the two double-underscore placeholders below before sending.
 // The read library and the body are defined first, at top level: the body sees the library but not the envelope's variables.
 
-// Read library of the read tools (specs/002-read-model/plan.md section 3). It only reads: getters, enumerations, isSameNode.
+// Library of the read tools (specs/002-read-model/plan.md section 3) and the write tools (specs/003-write-model/plan.md
+// section 3). The read functions only read: getters, enumerations, isSameNode.
 var ttam = (() => {
   const TAG = 'ttam-id';
   const SHAPES = { Rectangle: 'rect', Ellipse: 'ellipse', Star: 'star' };
+  const FILLED = ['artboard', 'rect', 'ellipse', 'star', 'shape', 'path'];
   const CLASSES = { PolyCurveNode: 'path', ImageNode: 'image', ContainerNode: 'layer', GroupNode: 'group', RasterNode: 'raster', PatternRasterNode: 'raster' };
   const r2 = (v) => Math.round(v * 100) / 100;
   const deg = (rad) => r2((rad * 180) / Math.PI);
@@ -26,15 +28,16 @@ var ttam = (() => {
       nodes.forEach((node, i) => {
         const p = path + '/' + i;
         let id = p;
+        let tag = null;
         if (node.tagInterface.hasKey(TAG)) {
-          const tag = String(node.tagInterface.getValueForKey(TAG));
+          tag = String(node.tagInterface.getValueForKey(TAG));
           if (!claimed.has(tag)) {
             claimed.add(tag);
             id = tag;
           }
         }
         const children = node.children.toArray();
-        visit(node, { spread, path: p, id, parentId, depth, childCount: children.length });
+        visit(node, { spread, path: p, id, tag, parentId, depth, childCount: children.length });
         down(children, p, id, depth + 1, spread);
       });
     doc.spreads.toArray().forEach((s, i) => down(s.children.toArray(), String(i), null, 1, i));
@@ -93,7 +96,7 @@ var ttam = (() => {
     if (color === null || !node.lineWeight) return null;
     const s = { color, width: r2(node.lineWeight), align: String(node.strokeAlignment), cap: String(node.lineCap), join: String(node.lineJoin) };
     const dash = node.dashPattern;
-    if (dash && dash.length) s.dash = Array.from(dash, (d) => r2(d));
+    if (dash && dash.length && String(node.lineType) === 'Dash') s.dash = Array.from(dash, (d) => r2(d)); // R-37: other types ignore the pattern
     return s;
   }
 
@@ -101,12 +104,13 @@ var ttam = (() => {
   // ponytail: runs cover the whole story, so linked frames report each other's runs; limit to storyRange if needed.
   function text(node, dpi) {
     const story = node.story;
+    const scale = Math.abs(node.transform.decompose().scaleY) || 1; // R-38: a scaled node draws its text scaled
     const key = (r) => JSON.stringify([r.family, r.style, r.weight, r.italic, r.size, r.color]);
     const runs = [];
     for (const r of story.glyphAttRuns) {
       const a = r.glyphAtts;
       const font = a.font;
-      const run = { text: story.getText(r.begin, r.end - r.begin), family: font.familyName, style: font.traitsName, weight: font.weight, italic: font.isItalic, size: r2((a.height * 72) / dpi), color: fill(a.brushFill) };
+      const run = { text: story.getText(r.begin, r.end - r.begin), family: font.familyName, style: font.traitsName, weight: font.weight, italic: font.isItalic, size: r2((a.height * 72 * scale) / dpi), color: fill(a.brushFill) };
       const last = runs[runs.length - 1];
       if (last && key(last) === key(run)) last.text += run.text;
       else runs.push(run);
@@ -142,7 +146,8 @@ var ttam = (() => {
     const blend = String(node.blendMode);
     if (blend !== 'Normal') e.blendMode = blend;
     const isText = e.type === 'text';
-    if (node.hasBrushFill && !isText) e.fill = fill(node.brushFillDescriptor);
+    // R-44: an unfilled shape reports hasBrushFill false, and its descriptor must not be read.
+    if (FILLED.includes(e.type)) e.fill = node.hasBrushFill ? fill(node.brushFillDescriptor) : null;
     if (node.hasPenFill) e.stroke = stroke(node);
     if (isText) e.text = text(node, dpi);
     const effects = node.layerEffectsInterface.effects;
@@ -238,7 +243,631 @@ var ttam = (() => {
     };
   }
 
-  return { getDocument, getNodes, listFonts };
+  // ---- Write library (specs/003-write-model/plan.md section 3) ----
+
+  const RAD = Math.PI / 180;
+  const CORNERS = ['topLeft', 'topRight', 'bottomLeft', 'bottomRight'];
+  let modules;
+  const sdk = () =>
+    modules ||
+    (modules = {
+      N: require('/nodes.js'),
+      C: require('/commands.js'),
+      S: require('/shapes.js'),
+      G: require('/geometry.js'),
+      K: require('/colours.js'),
+      F: require('/fills.js'),
+      L: require('/linestyle.js'),
+      B: require('/blendmodeinterface.js').BlendMode,
+      FX: require('/layereffects.js'),
+      Sel: require('/selections.js'),
+      SB: require('/storybuilder.js').StoryBuilder,
+      SD: require('/storydelta.js'),
+      GA: require('/glyphatts.js').GlyphAttDoubleType,
+    });
+
+  // Waves (plan 3.4): the children of a new layer join its wave unless one of them is a layer (R-32, R-42).
+  function plan(specs) {
+    const waves = [];
+    let groups = [{ parent: null, specs }];
+    while (groups.length) {
+      const next = [];
+      waves.push(
+        groups.map((g) => ({
+          parent: g.parent,
+          items: g.specs.map((spec) => {
+            const kids = spec.children || [];
+            const inline = kids.every((c) => c.type !== 'layer');
+            if (kids.length && !inline) next.push({ parent: spec.id, specs: kids });
+            return { spec, inline: inline ? kids : [] };
+          }),
+        })),
+      );
+      groups = next;
+    }
+    return waves;
+  }
+
+  function nextId(type, used) {
+    for (let n = 1; ; n++) {
+      if (!used.has(type + n)) {
+        used.add(type + n);
+        return type + n;
+      }
+    }
+  }
+
+  function distance(a, b) {
+    let row = Array.from({ length: b.length + 1 }, (_, i) => i);
+    for (let i = 1; i <= a.length; i++) {
+      const next = [i];
+      for (let j = 1; j <= b.length; j++) next[j] = Math.min(row[j] + 1, next[j - 1] + 1, row[j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1));
+      row = next;
+    }
+    return row[b.length];
+  }
+
+  // FR-312: family and style by name in any case; without a style the face of weight 400 that is not italic.
+  function matchFont(families, family, style) {
+    const all = families.map((f) => ({ f, name: f.name, key: lower(f.name) }));
+    const q = lower(family);
+    const hit = all.find((x) => x.key === q);
+    if (!hit) {
+      const rank = (x) => (x.key.includes(q) || q.includes(x.key) ? 0 : 1000) + distance(x.key, q);
+      return { missing: 'family', suggestions: all.sort((a, b) => rank(a) - rank(b)).slice(0, 5).map((x) => x.name) };
+    }
+    const faces = Array.from(hit.f.fonts);
+    const face = style ? faces.find((x) => lower(x.traitsName) === lower(style)) : faces.find((x) => x.weight === 400 && !x.isItalic) || faces[0];
+    if (!face) return { missing: 'style', family: hit.name, styles: faces.map((x) => x.traitsName) };
+    return { family: hit.name, style: face.traitsName, postscriptName: face.postscriptName };
+  }
+
+  // R-40: linear along the angle through the box centre, radial as an ellipse centred in the box.
+  function gradientData(b, kind, angle) {
+    const [x, y, w, h] = b;
+    if (kind !== 'Linear') return [w / 2, 0, x + w / 2, 0, h / 2, y + h / 2];
+    const a = (angle || 0) * RAD;
+    const c = Math.cos(a);
+    const s = Math.sin(a);
+    const len = Math.abs(w * c) + Math.abs(h * s);
+    return [len * c, -len * s, x + w / 2 - (len / 2) * c, len * s, len * c, y + h / 2 - (len / 2) * s];
+  }
+
+  // R-33: rotation by deg (clockwise on the page) about (cx, cy).
+  function rotationData(cx, cy, deg) {
+    const c = Math.cos(deg * RAD);
+    const s = Math.sin(deg * RAD);
+    return [c, -s, cx - c * cx + s * cy, s, c, cy - s * cx - c * cy];
+  }
+
+  // Scale about the box corner and move it: box `from` becomes box `to`; a side of length 0 keeps scale 1.
+  function boxData(from, to) {
+    const sx = from[2] ? to[2] / from[2] : 1;
+    const sy = from[3] ? to[3] / from[3] : 1;
+    return [sx, 0, to[0] - sx * from[0], 0, sy, to[1] - sy * from[1]];
+  }
+
+  // Paragraphs as [begin, end) in code points (R-30), each including its break.
+  function paragraphRanges(text) {
+    const points = [...text];
+    const out = [];
+    let begin = 0;
+    points.forEach((ch, i) => {
+      if (ch === '\n' || ch === '\u2029') {
+        out.push([begin, i + 1]);
+        begin = i + 1;
+      }
+    });
+    out.push([begin, points.length]);
+    return out;
+  }
+
+  // FR-302: undo back to the start when anything throws (R-41).
+  function atomic(doc, fn) {
+    const start = doc.history.position;
+    try {
+      return fn();
+    } catch (e) {
+      for (let n = doc.history.position - start; n > 0; n--) doc.undo();
+      const error = new Error((e && e.message ? e.message : String(e)) + ' Nothing was changed: the document was restored to its state before the call.');
+      if (e && e.stack) error.stack = e.stack;
+      throw error;
+    }
+  }
+
+  const hexColour = (hex) => {
+    const v = parseInt(hex.slice(1), 16);
+    const a = hex.length === 9;
+    return sdk().K.Colour.createRGBA8({ r: (a ? v >>> 24 : v >>> 16) & 255, g: (a ? v >>> 16 : v >>> 8) & 255, b: (a ? v >>> 8 : v) & 255, alpha: a ? v & 255 : 255 });
+  };
+  const solidFill = (hex) => sdk().F.FillDescriptor.createSolid(sdk().F.SolidFill.create(hexColour(hex)));
+  const centre = (b) => [b[0] + b[2] / 2, b[1] + b[3] / 2];
+  const rectangle = (b) => new (sdk().G.Rectangle)(b[0], b[1], b[2], b[3]);
+  const matrix = (data) => new (sdk().G.Transform)(data[0], data[1], data[2], data[3], data[4], data[5]);
+
+  function fillDescriptor(f, box) {
+    const { F, K } = sdk();
+    if (f === undefined || f === null) return F.FillDescriptor.createNone();
+    if (typeof f === 'string') return solidFill(f);
+    const g = K.Gradient.create(f.stops.map((s) => ({ colour: hexColour(s.color), position: s.at })));
+    return F.FillDescriptor.create(F.GradientFill.create(g, F.GradientFillType[f.gradient]), true, matrix(gradientData(box, f.gradient, f.angle)));
+  }
+
+  // R-37: a solid style without pattern; dashes need type Dash.
+  function lineStyle(st) {
+    const { L } = sdk();
+    const ls = L.LineStyle.createDefaultWithWeight(st ? (st.width === undefined ? 1 : st.width) : 0);
+    if (st && st.cap) ls.cap = L.LineCap[st.cap];
+    if (st && st.join) ls.join = L.LineJoin[st.join];
+    if (st && st.dash && st.dash.length) {
+      ls.type = L.LineType.Dash;
+      ls.dashPattern = st.dash;
+    }
+    return L.LineStyleDescriptor.create(ls, { strokeAlignment: L.StrokeAlignment[(st && st.align) || 'Centre'] });
+  }
+  const penFill = (st) => (st ? solidFill(st.color || '#000000ff') : sdk().F.FillDescriptor.createNone());
+
+  function shapeOf(s) {
+    const { S } = sdk();
+    if (s.type === 'rect') {
+      const r = S.ShapeRectangle.create();
+      if (s.cornerRadius) setCorners(r, s.cornerRadius, s.box);
+      return r;
+    }
+    if (s.type === 'ellipse') return S.ShapeEllipse.create();
+    const shape = s.type === 'star' ? S.ShapeStar.create() : S['Shape' + s.kind].create();
+    reshape(shape, s);
+    return shape;
+  }
+
+  // R-39: radius in pixels needs absolute sizes and the Round corner type.
+  function setCorners(r, radius, box) {
+    const { S } = sdk();
+    r.setAbsoluteSizes(true, box[2], box[3]);
+    for (const c of CORNERS) {
+      r[c].cornerType = S.ShapeCornerType.Round;
+      r[c].setRadius(radius, box[2], box[3]);
+    }
+  }
+
+  function reshape(shape, s) {
+    if (s.points !== undefined) shape.points = s.points;
+    if (s.innerRadius !== undefined) shape.innerRadius = s.innerRadius;
+    if (s.sides !== undefined) shape.sides = s.sides;
+  }
+
+  // Resolves every family and style named by the specs (FR-312); {fail} when one is missing without fallback.
+  function resolveFonts(specs, fallback) {
+    const key = (family, style) => lower(family) + '\u0000' + lower(style || '');
+    const wanted = new Map();
+    for (const s of specs) {
+      for (const st of [s].concat(s.runs || [])) {
+        const family = st.family || s.family;
+        if (family) wanted.set(key(family, st.style || s.style), { family, style: st.style || s.style });
+      }
+    }
+    const faces = new Map();
+    const warnings = [];
+    const families = wanted.size ? require('/fonts.js').FontFamily.all : [];
+    for (const [k, r] of wanted) {
+      const hit = matchFont(families, r.family, r.style);
+      if (!hit.missing) {
+        faces.set(k, hit);
+        continue;
+      }
+      const reason =
+        hit.missing === 'family'
+          ? 'Font family "' + r.family + '" is not installed; the closest installed families are ' + hit.suggestions.join(', ') + '.'
+          : 'Style "' + r.style + '" of "' + hit.family + '" is not installed; its styles are ' + hit.styles.join(', ') + '.';
+      if (!fallback) return { fail: reason + ' Choose one with list_fonts, or set fontFallback to let Affinity substitute it. Nothing was changed.' };
+      warnings.push(reason + ' Affinity substitutes it.');
+    }
+    return { warnings, face: (family, style) => faces.get(key(family, style)) || null };
+  }
+
+  // One composite glyph delta for a style; null when it sets nothing (R-30, R-36).
+  function glyphDelta(st, dpi, scale, fonts) {
+    const { SD, GA } = sdk();
+    const parts = [];
+    if (st.family) {
+      const face = fonts.face(st.family, st.style);
+      parts.push(face ? SD.StoryDelta.createPostscriptName(face.postscriptName) : SD.StoryDelta.createFamilyName(st.family));
+    }
+    if (st.size !== undefined) parts.push(SD.StoryDelta.createGlyphDouble(GA.Height, (st.size * dpi) / 72 / scale));
+    if (st.color) parts.push(SD.StoryDelta.createBrushFill(solidFill(st.color)));
+    return parts.length ? SD.StoryDelta.createComposite(parts) : null;
+  }
+
+  const alignDelta = (name) => sdk().SD.StoryDelta.createAlignX(sdk().SD.ParagraphAlignXType[name]);
+  const alignAt = (align, i) => (Array.isArray(align) ? align[i] : align);
+  const runStyle = (s, r) => ({ family: r.family || s.family, style: r.style || s.style, size: r.size === undefined ? s.size : r.size, color: r.color || s.color });
+
+  function story(s, dpi, fonts) {
+    const sb = sdk().SB.create();
+    if (s.kind === 'frame') sb.setToFrameTextDefaultStyle(dpi);
+    else sb.setToArtisticTextDefaultStyle(dpi);
+    let paragraph = 0;
+    const align = () => {
+      const a = alignAt(s.align, paragraph);
+      if (a) sb.applyParagraphDelta(alignDelta(a));
+    };
+    align();
+    for (const r of s.runs || [{ text: s.text }]) {
+      const d = glyphDelta(runStyle(s, r), dpi, 1, fonts);
+      if (d) sb.applyGlyphDelta(d);
+      r.text.split('\n').forEach((part, i) => {
+        if (i > 0) {
+          sb.addParagraphBreak();
+          paragraph++;
+          align();
+        }
+        if (part) sb.addText(part);
+      });
+    }
+    return sb;
+  }
+
+  function definition(s, dpi, fonts) {
+    const { N, G, F } = sdk();
+    let def;
+    let pivot;
+    if (s.type === 'layer') {
+      def = N.ContainerNodeDefinition.create(s.name || null);
+    } else if (s.type === 'path') {
+      const curves = G.PolyCurve.create();
+      for (const sub of s.segments) {
+        if (!sub.segments.length) continue;
+        const cb = G.CurveBuilder.create();
+        cb.beginXY(sub.start[0], sub.start[1]);
+        for (const g of sub.segments) {
+          if (g[0] === 'L') cb.lineToXY(g[1], g[2]);
+          else cb.addBezierXY(g[1], g[2], g[3], g[4], g[5], g[6]);
+        }
+        if (sub.closed) cb.close();
+        curves.addCurve(cb.createCurve());
+      }
+      const bb = curves.boundingBox; // R-40
+      const box = [bb.x, bb.y, bb.width, bb.height];
+      def = N.PolyCurveNodeDefinition.create(curves, fillDescriptor(s.fill, box), penFill(s.stroke), lineStyle(s.stroke), F.FillDescriptor.createNone());
+      pivot = centre(box);
+    } else if (s.type === 'text') {
+      const sb = story(s, dpi, fonts);
+      if (s.kind === 'frame') {
+        def = N.FrameTextNodeDefinition.createFromStoryBuilder(rectangle(s.box), sb);
+        pivot = centre(s.box);
+      } else {
+        def = N.ArtTextNodeDefinition.createFromStoryBuilder({ x: s.at[0], y: s.at[1] }, sb); // R-43: the first baseline starts at `at`
+        pivot = s.at;
+      }
+    } else {
+      def = N.ShapeNodeDefinition.create(shapeOf(s), rectangle(s.box), fillDescriptor(s.fill, s.box), penFill(s.stroke), lineStyle(s.stroke));
+      pivot = centre(s.box);
+    }
+    if (s.name !== undefined) def.userDescription = s.name;
+    if (s.rotation) def.transform = matrix(rotationData(pivot[0], pivot[1], s.rotation)); // R-33
+    return def;
+  }
+
+  const EFFECTS = {
+    OuterShadow: ['OuterShadowLayerEffect', 'createSetOuterShadowLayerEffect', true],
+    InnerShadow: ['InnerShadowLayerEffect', 'createSetInnerShadowLayerEffect', true],
+    OuterGlow: ['OuterGlowLayerEffect', 'createSetOuterGlowLayerEffect', false],
+    GaussianBlur: ['GaussianBlurLayerEffect', 'createSetGaussianBlurLayerEffect', false],
+  };
+
+  // R-34: the shadows take an index, the glow and the blur do not.
+  function effectCommand(sel, e) {
+    const { C, FX, B } = sdk();
+    const [cls, factory, indexed] = EFFECTS[e.type];
+    const fx = FX[cls].create();
+    fx.enabled = e.enabled !== false;
+    if (e.opacity !== undefined) fx.opacity = e.opacity;
+    if (e.blendMode) fx.blendMode = B[e.blendMode];
+    if (e.radius !== undefined) fx.radius = e.radius;
+    if (e.color && 'colour' in fx) fx.colour = hexColour(e.color);
+    if (e.offset !== undefined && 'offset' in fx) fx.offset = e.offset;
+    if (e.angle !== undefined && 'angle' in fx) fx.angle = e.angle * RAD;
+    if (e.intensity !== undefined && 'intensity' in fx) fx.intensity = e.intensity;
+    return indexed ? C.DocumentCommand[factory](sel, fx, 0) : C.DocumentCommand[factory](sel, fx);
+  }
+
+  // Settings that commands apply through the selection, null for the node just inserted (R-42).
+  function settings(s, sel) {
+    const { C, B, G } = sdk();
+    const D = C.DocumentCommand;
+    const out = [];
+    if (s.opacity !== undefined) out.push(D.createSetOpacity(sel, s.opacity));
+    if (s.blendMode !== undefined) out.push(D.createSetBlendMode(sel, B[s.blendMode]));
+    if (s.fillRule !== undefined) out.push(D.createSetWindingMode(sel, s.fillRule === 'evenodd' ? G.WindingOrder.OddEven : G.WindingOrder.NonZero));
+    for (const e of s.effects || []) out.push(effectCommand(sel, e));
+    return out;
+  }
+
+  function insert(cb, s, target, dpi, fonts) {
+    const { C, N } = sdk();
+    const b = C.AddChildNodesCommandBuilder.create();
+    b.addNode(definition(s, dpi, fonts));
+    if (target) {
+      b.setInsertionTarget(target);
+      b.setInsertionMode(C.InsertionMode.Inside_AtBack); // R-32: appends in front
+    }
+    cb.addCommand(b.createCommand(true, N.NodeChildType.Main));
+    cb.addCommand(C.DocumentCommand.createSetTagValueForKey(null, TAG, s.id));
+    for (const c of settings(s, null)) cb.addCommand(c);
+  }
+
+  const flat = (specs) => specs.flatMap((s) => [s].concat(flat(s.children || [])));
+
+  // Finds nodes and the spread top level by ID; collects every tag. A string of digits names the top level of that spread.
+  function scan(doc, ids) {
+    const wanted = new Set(ids);
+    const found = new Map();
+    const used = new Set();
+    const spreads = doc.spreads.toArray();
+    for (const id of ids) if (/^\d+$/.test(id) && +id < spreads.length) found.set(id, { node: spreads[+id], v: { spread: +id, path: id, id, top: true } });
+    walk(doc, (node, v) => {
+      if (v.tag !== null) used.add(v.tag);
+      for (const k of [v.path, v.id]) if (wanted.has(k) && !found.has(k)) found.set(k, { node, v });
+    });
+    const unknown = ids.filter((id) => !found.has(id));
+    return { found, used, spreads, here: Math.max(0, spreads.findIndex((s) => s.isSameNode(doc.currentSpread))), unknown: unknown.filter((x, i) => unknown.indexOf(x) === i) };
+  }
+
+  const nothing = ' Nothing was changed.';
+  const unknownIds = (ids) => ({ fail: 'No node has the ID ' + ids.map((x) => '"' + x + '"').join(', ') + '.' + nothing });
+  const twoSpreads = { fail: 'The nodes lie on more than one spread; change each spread in its own call.' + nothing };
+  const switchTo = (cb, at) => at.spread !== at.here && cb.addCommand(sdk().C.DocumentCommand.createSetCurrentSpread(at.spreads[at.spread])); // R-42
+
+  // create_nodes (plan 3.4).
+  function createNodes(o) {
+    const doc = current();
+    if (!doc) return null;
+    const { C } = sdk();
+    const { found, used, spreads, here, unknown } = scan(doc, o.parentId === undefined ? [] : [o.parentId]);
+    if (unknown.length) return { fail: 'The parent "' + o.parentId + '" was not found.' + nothing };
+    const parentHit = o.parentId === undefined ? null : found.get(o.parentId);
+    const spread = parentHit ? parentHit.v.spread : o.spreadIndex === undefined ? here : o.spreadIndex;
+    if (spread >= spreads.length) return { fail: 'Spread ' + spread + ' does not exist; the document has ' + spreads.length + ' spread(s), indexed from 0.' + nothing };
+    const parent = parentHit ? parentHit.node : spreads[spread];
+    const all = flat(o.nodes);
+    const taken = all.find((s) => s.id !== undefined && used.has(s.id));
+    if (taken) return { fail: 'The ID "' + taken.id + '" is already used in the document.' + nothing };
+    for (const s of all) if (s.id !== undefined) used.add(s.id);
+    for (const s of all) if (s.id === undefined) s.id = nextId(s.type, used);
+    const fonts = resolveFonts(all.filter((s) => s.type === 'text'), o.fontFallback);
+    if (fonts.fail) return fonts;
+    const waves = plan(o.nodes);
+    return atomic(doc, () => {
+      waves.forEach((wave, w) => {
+        const cb = C.CompoundCommandBuilder.create();
+        if (w === 0) switchTo(cb, { spread, here, spreads });
+        const parents = w === 0 ? null : scan(doc, wave.map((g) => g.parent)).found;
+        for (const g of wave) {
+          const target = g.parent === null ? parent : parents.get(g.parent).node;
+          for (const item of g.items) {
+            insert(cb, item.spec, target, doc.dpi, fonts);
+            for (const child of item.inline) insert(cb, child, null, doc.dpi, fonts); // R-32: into the selected new layer, then in front of each other
+          }
+        }
+        doc.executeCommand(cb.createCommand());
+      });
+      const names = new Map();
+      walk(doc, (node, v) => v.tag !== null && !names.has(v.tag) && names.set(v.tag, node.description));
+      const mirror = (specs) => specs.map((s) => Object.assign({ id: s.id, name: names.get(s.id) }, s.children ? { children: mirror(s.children) } : {}));
+      const out = { created: mirror(o.nodes), undoSteps: waves.length };
+      if (fonts.warnings.length) out.warnings = fonts.warnings;
+      if (spread !== here) out.spread = spread;
+      return out;
+    });
+  }
+
+  function strokeCommands(st, sel) {
+    const { C, L } = sdk();
+    const D = C.DocumentCommand;
+    const M = L.LineStyleMask;
+    const out = [];
+    if (st.color) out.push(D.createSetPenFill(sel, solidFill(st.color)));
+    const ls = L.LineStyle.createDefaultWithWeight(st.width === undefined ? 1 : st.width);
+    let mask = st.width === undefined ? 0 : M.Weight.value;
+    if (st.cap) {
+      ls.cap = L.LineCap[st.cap];
+      mask |= M.Cap.value;
+    }
+    if (st.join) {
+      ls.join = L.LineJoin[st.join];
+      mask |= M.Join.value;
+    }
+    if (st.dash) {
+      ls.type = st.dash.length ? L.LineType.Dash : L.LineType.Solid;
+      ls.dashPattern = st.dash;
+      mask |= M.DashPattern.value | M.Type.value;
+    }
+    if (mask) out.push(D.createSetLineStyle(sel, ls, { lineStyleMask: mask })); // R-37: a numeric mask of the fields given
+    if (st.align) out.push(D.createSetStrokeAlignment(sel, L.StrokeAlignment[st.align]));
+    return out;
+  }
+
+  // Text content and style (FR-320, R-38): ranges count code points from the start of the node's story.
+  function textCommands(add, doc, node, s, fonts) {
+    const { C, Sel } = sdk();
+    const D = C.DocumentCommand;
+    const base = node.storyRange.begin;
+    const select = (range) => {
+      const sel = Sel.Selection.create(doc, node);
+      sel.addSubSelectionForNode(node, Sel.TextSelection.create(range));
+      return sel;
+    };
+    const span = (b, e) => select([{ begin: base + b, end: base + e }]);
+    const content = s.runs ? s.runs.map((r) => r.text).join('') : s.text;
+    if (content !== undefined) add(D.createSetText(select(node.storyRange), content));
+    const text = content === undefined ? node.text : content;
+    const length = [...text].length;
+    const scale = Math.abs(node.transform.decompose().scaleY) || 1;
+    const whole = glyphDelta(s, doc.dpi, scale, fonts);
+    if (whole && length) add(D.createFormatText(span(0, length), whole));
+    let at = 0;
+    for (const r of s.runs || []) {
+      const n = [...r.text].length;
+      const d = glyphDelta(runStyle(s, r), doc.dpi, scale, fonts);
+      if (d && n) add(D.createFormatText(span(at, at + n), d));
+      at += n;
+    }
+    if (s.align !== undefined) {
+      paragraphRanges(text).forEach(([b, e], i) => {
+        const a = alignAt(s.align, i);
+        if (a && e > b) add(D.createFormatText(span(b, e), alignDelta(a)));
+      });
+    }
+  }
+
+  // R-35: Before a sibling to land at `index`, After the last child, or Inside an empty parent.
+  function moveCommand(node, mv, found) {
+    const { C } = sdk();
+    const T = C.NodeMoveType;
+    const parent = mv.parentId === undefined ? node.parent : found.get(mv.parentId).node;
+    const others = parent.children.toArray().filter((c) => !c.isSameNode(node));
+    const sel = node.selfSelection;
+    if (mv.index !== undefined && mv.index < others.length) return C.DocumentCommand.createMoveNodes(sel, others[mv.index], T.Before);
+    if (others.length) return C.DocumentCommand.createMoveNodes(sel, others[others.length - 1], T.After);
+    return C.DocumentCommand.createMoveNodes(sel, parent, T.Inside);
+  }
+
+  // Why a `set` field cannot apply to a node, or null.
+  function misfit(node, t, s) {
+    const has = (k) => s[k] !== undefined;
+    if ((has('fill') || has('stroke')) && !FILLED.includes(t)) return 'fill and stroke do not apply to ' + t + ' nodes.';
+    if (has('cornerRadius') && t !== 'rect') return 'cornerRadius applies only to rect nodes.';
+    if ((has('points') || has('innerRadius')) && t !== 'star') return 'points and innerRadius apply only to star nodes.';
+    if (has('sides') && String(node.shapeType) !== 'Polygon') return 'sides applies only to shapes of kind Polygon.';
+    const textFields = ['text', 'runs', 'family', 'style', 'size', 'color', 'align'].filter(has);
+    if (textFields.length && t !== 'text') return textFields.join(', ') + ' apply only to text nodes.';
+    if (has('box') && t === 'text') {
+      const b = node.spreadBaseBox;
+      if (Math.abs(s.box[2] - b.width) > 0.01 || Math.abs(s.box[3] - b.height) > 0.01) return 'a text node can only be moved: keep its box size ' + r2(b.width) + ' x ' + r2(b.height) + ' and change the text size with size (R-38).';
+    }
+    return null;
+  }
+
+  // update_nodes (plan 3.5).
+  function updateNodes(o) {
+    const doc = current();
+    if (!doc) return null;
+    const { C } = sdk();
+    const D = C.DocumentCommand;
+    const ids = [];
+    for (const u of o.updates) ids.push(u.id, ...(u.move && u.move.parentId !== undefined ? [u.move.parentId] : []));
+    const at = scan(doc, ids);
+    if (at.unknown.length) return unknownIds(at.unknown);
+    const spreadsHit = new Set(ids.map((id) => at.found.get(id).v.spread));
+    if (spreadsHit.size > 1) return twoSpreads;
+    at.spread = [...spreadsHit][0];
+    for (const u of o.updates) {
+      const hit = at.found.get(u.id);
+      if (hit.v.top) return { fail: '"' + u.id + '" is a spread, not a node.' + nothing };
+      const problem = misfit(hit.node, typeOf(hit.node).type, u.set || {});
+      if (problem) return { fail: 'Node "' + u.id + '": ' + problem + nothing };
+    }
+    const fonts = resolveFonts(o.updates.filter((u) => u.set && (u.set.family || u.set.runs)).map((u) => u.set), o.fontFallback);
+    if (fonts.fail) return fonts;
+    return atomic(doc, () => {
+      const cb = C.CompoundCommandBuilder.create();
+      const add = (c) => cb.addCommand(c);
+      switchTo(cb, at);
+      const retagged = new Map();
+      const updated = o.updates.map((u) => {
+        const { node, v } = at.found.get(u.id);
+        const s = u.set || {};
+        const sel = node.selfSelection;
+        if (s.name !== undefined) add(D.createSetDescription(sel, s.name));
+        const b0 = node.spreadBaseBox;
+        let box = [b0.x, b0.y, b0.width, b0.height];
+        if (s.box) {
+          add(D.createTransform(sel, matrix(boxData(box, s.box))));
+          box = s.box;
+        }
+        if (s.rotation !== undefined) {
+          const turn = s.rotation - node.transform.decompose().rotation / RAD;
+          if (Math.abs(turn) > 1e-9) add(D.createTransform(sel, matrix(rotationData(box[0] + box[2] / 2, box[1] + box[3] / 2, turn))));
+        }
+        if (s.fill !== undefined) add(D.createSetBrushFill(sel, fillDescriptor(s.fill, box)));
+        if (s.stroke === null) add(D.createSetPenFill(sel, sdk().F.FillDescriptor.createNone()));
+        else if (s.stroke) strokeCommands(s.stroke, sel).forEach(add);
+        settings({ opacity: s.opacity, blendMode: s.blendMode }, sel).forEach(add);
+        if (s.effects) {
+          add(D.createRemoveAllLayerEffects(sel));
+          for (const e of s.effects) add(effectCommand(sel, e));
+        }
+        if (s.cornerRadius !== undefined || s.points !== undefined || s.innerRadius !== undefined || s.sides !== undefined) {
+          const shape = node.shape.clone();
+          if (s.cornerRadius !== undefined) setCorners(shape, s.cornerRadius, box);
+          reshape(shape, s);
+          add(D.createSetShape(sel, shape));
+        }
+        if (['text', 'runs', 'family', 'style', 'size', 'color', 'align'].some((k) => s[k] !== undefined)) textCommands(add, doc, node, s, fonts);
+        if (u.move) add(moveCommand(node, u.move, at.found));
+        if (s.hidden !== undefined) add(D.createSetVisibility(sel, !s.hidden));
+        if (s.locked !== undefined) add(D.createSetEditable(sel, !s.locked));
+        if (v.id !== v.path) return { id: v.id };
+        if (!retagged.has(v.path)) {
+          retagged.set(v.path, nextId(typeOf(node).type, at.used));
+          add(D.createSetTagValueForKey(sel, TAG, retagged.get(v.path))); // FR-306, R-41: also replaces a duplicated tag
+        }
+        return { id: retagged.get(v.path), was: v.path };
+      });
+      doc.executeCommand(cb.createCommand());
+      const out = { updated, undoSteps: 1 };
+      if (fonts.warnings.length) out.warnings = fonts.warnings;
+      if (at.spread !== at.here) out.spread = at.spread;
+      return out;
+    });
+  }
+
+  // delete_nodes (plan 3.6).
+  function deleteNodes(o) {
+    const doc = current();
+    if (!doc) return null;
+    const { C, Sel } = sdk();
+    const at = scan(doc, o.ids);
+    if (at.unknown.length) return unknownIds(at.unknown);
+    const hits = [...new Map(o.ids.map((id) => [at.found.get(id).v.path, at.found.get(id)])).values()];
+    if (hits.some((h) => h.v.top)) return { fail: 'Spreads cannot be deleted with delete_nodes.' + nothing };
+    const spreadsHit = new Set(hits.map((h) => h.v.spread));
+    if (spreadsHit.size > 1) return twoSpreads;
+    at.spread = [...spreadsHit][0];
+    return atomic(doc, () => {
+      const cb = C.CompoundCommandBuilder.create();
+      switchTo(cb, at);
+      cb.addCommand(C.DocumentCommand.createDeleteSelection(Sel.Selection.create(doc, hits.map((h) => h.node), true)));
+      doc.executeCommand(cb.createCommand());
+      const out = { deleted: hits.length, undoSteps: 1 };
+      if (at.spread !== at.here) out.spread = at.spread;
+      return out;
+    });
+  }
+
+  // undo (plan 3.6): the description getters throw at position 0, history items do not (R-06, R-45).
+  function undo(o) {
+    const doc = current();
+    if (!doc) return null;
+    const h = doc.history;
+    let done = 0;
+    while (done < o.steps && (o.redo ? h.canRedo : h.canUndo)) {
+      if (o.redo) doc.redo();
+      else doc.undo();
+      done++;
+    }
+    const item = (i) => {
+      try {
+        const it = h.getItem(i);
+        return it ? it.description : null;
+      } catch (e) {
+        return null;
+      }
+    };
+    return { done, position: h.position, size: h.size, undo: h.canUndo ? item(h.position - 1) : null, redo: h.canRedo ? item(h.position) : null };
+  }
+
+  return { getDocument, getNodes, listFonts, createNodes, updateNodes, deleteNodes, undo, plan, nextId, matchFont, gradientData, rotationData, boxData, paragraphRanges, atomic };
 })();
 
 var __ttamBody = function () {
@@ -324,7 +953,7 @@ __BODY__
       name: e && e.name ? String(e.name) : undefined,
       stack: e && e.stack ? String(e.stack) : undefined,
     };
-    if (before && after && before.id === after.id && after.position !== before.position) error.undoSteps = after.position - before.position;
+    if (before && after && before.id === after.id && after.position > before.position) error.undoSteps = after.position - before.position;
     fail(error);
     return;
   }

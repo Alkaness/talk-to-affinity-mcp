@@ -518,3 +518,286 @@ return doc.sessionUuid;`;
   const one = textOf(await t.call('get_document', { depth: 1 }));
   assert.ok(one.length < 60000, `${one.length} characters`);
 });
+
+// Slice 003: write model
+
+/** Creates a document with the given options code and returns its UUID; the setup's cleanup closes it. */
+async function makeDocument(t: Awaited<ReturnType<typeof setup>>, options = 'o.width = 800; o.height = 600; o.dpi = 72;') {
+  const code = `const { Document, NewDocumentOptions } = require('/document.js'); const { UnitType } = require('/units.js'); const o = NewDocumentOptions.createDefault(); o.units = UnitType.Pixel; ${options} return Document.create(o).sessionUuid;`;
+  const id = jsonOf(await t.call('run_script', { code })).result as string;
+  t.documents.push(id);
+  return id;
+}
+
+const HISTORY = "const d = require('/application.js').app.documents.current; return { position: d.history.position, top: d.currentSpread.children.toArray().length };";
+const history = async (t: Awaited<ReturnType<typeof setup>>) => jsonOf(await t.call('run_script', { code: HISTORY, mutates: false })).result as { position: number; top: number };
+const nodes = async (t: Awaited<ReturnType<typeof setup>>, ids: string[]) => jsonOf(await t.call('get_nodes', { ids }));
+
+live('FR-303 FR-307 FR-308 FR-309 FR-310 FR-311 FR-313 FR-314 FR-315 FR-316 create_nodes builds a layout in 1 undo step', async (ctx) => {
+  const t = await setup(ctx);
+  await makeDocument(t);
+  const before = await history(t);
+  const r = jsonOf(
+    await t.call('create_nodes', {
+      nodes: [
+        { type: 'rect', id: 'bg', name: 'Background', box: [0, 0, 800, 600], fill: '#f0f0f0' },
+        { type: 'text', at: [40, 80], text: 'Title', family: 'Arial', style: 'Bold', size: 36, color: '#202020' },
+        { type: 'ellipse', box: [40, 120, 100, 100], fill: { gradient: 'Radial', stops: [{ at: 0, color: '#ff0000' }, { at: 1, color: '#0000ff' }] } },
+        { type: 'star', box: [160, 120, 100, 100], points: 6, innerRadius: 0.5, fill: '#ffcc00', stroke: { color: '#000000', width: 2, dash: [3, 1] } },
+        { type: 'shape', kind: 'Polygon', sides: 6, box: [280, 120, 100, 100], fill: { gradient: 'Linear', angle: 90, stops: [{ at: 0, color: '#00ff00' }, { at: 1, color: '#004400' }] } },
+        { type: 'path', id: 'icon', d: 'M400 120 h100 v100 h-100 Z M420 170 A30 30 0 0 1 480 170 Z', fill: '#00aa00', fillRule: 'evenodd' },
+        { type: 'rect', box: [520, 120, 120, 60], cornerRadius: 12, rotation: 30, opacity: 0.5, blendMode: 'Multiply', effects: [{ type: 'OuterShadow', radius: 6, offset: 4, angle: 45, color: '#000000' }] },
+        { type: 'text', kind: 'frame', box: [40, 260, 300, 120], runs: [{ text: 'Bold ', family: 'Arial', style: 'Bold', size: 14 }, { text: 'plain\nSecond', family: 'Georgia', size: 12, color: '#0000ff' }], align: ['Left', 'Centre'] },
+      ],
+    }),
+  );
+  assert.deepEqual(
+    r.created.map((n: { id: string }) => n.id),
+    ['bg', 'text1', 'ellipse1', 'star1', 'shape1', 'icon', 'rect1', 'text2'],
+  );
+  assert.equal(r.undoSteps, 1);
+  const after = await history(t);
+  assert.equal(after.position - before.position, 1);
+  assert.equal(after.top - before.top, 8);
+  const [bg, title, ellipse, star, polygon, icon, rect, frame] = await nodes(t, r.created.map((n: { id: string }) => n.id));
+  assert.deepEqual([bg.name, bg.box, bg.fill], ['Background', [0, 0, 800, 600], '#f0f0f0ff']);
+  assert.deepEqual(title.text.runs, [{ text: 'Title', family: 'Arial', style: 'Bold', weight: 700, italic: false, size: 36, color: '#202020ff' }]);
+  assert.ok(Math.abs(title.box[1] + title.box[3] - 80) < 1, `baseline at 80: ${title.box}`); // R-43
+  assert.deepEqual(ellipse.fill, { gradient: 'Radial', stops: [{ at: 0, color: '#ff0000ff' }, { at: 1, color: '#0000ffff' }] });
+  assert.deepEqual(star.stroke, { color: '#000000ff', width: 2, align: 'Centre', cap: 'Butt', join: 'Round', dash: [3, 1] });
+  assert.deepEqual([polygon.type, polygon.kind, polygon.fill.gradient], ['shape', 'Polygon', 'Linear']);
+  assert.deepEqual([icon.type, icon.fill, icon.box], ['path', '#00aa00ff', [400, 120, 100, 100]]);
+  assert.deepEqual([rect.rotation, rect.opacity, rect.blendMode], [30, 0.5, 'Multiply']);
+  assert.deepEqual(rect.effects, [{ type: 'OuterShadow', enabled: true, opacity: 0.5, blendMode: 'Multiply', radius: 6, color: '#000000ff', offset: 4, angle: 45, intensity: 0 }]);
+  assert.ok(Math.abs(rect.box[0] + rect.box[2] / 2 - 580) < 0.01 && Math.abs(rect.box[1] + rect.box[3] / 2 - 150) < 0.01, `centre kept: ${rect.box}`);
+  assert.deepEqual(
+    frame.text.runs.map((x: { text: string; family: string; style: string; size: number; color: string }) => [x.text, x.family, x.style, x.size, x.color]),
+    [
+      ['Bold ', 'Arial', 'Bold', 14, '#000000ff'],
+      ['plain\nSecond', 'Georgia', 'Regular', 12, '#0000ffff'],
+    ],
+  );
+  assert.deepEqual(frame.text.align, ['Left', 'Centre']);
+  assert.equal((await t.call('render')).content[0].type, 'image');
+});
+
+live('FR-303 FR-316 a card layer is 1 undo step; a layer inside a new layer adds one', async (ctx) => {
+  const t = await setup(ctx);
+  await makeDocument(t);
+  const p0 = (await history(t)).position;
+  const card = jsonOf(
+    await t.call('create_nodes', {
+      nodes: [{ type: 'layer', id: 'card', name: 'Card', children: [{ type: 'rect', box: [10, 10, 100, 60], fill: '#ffffff', opacity: 0.5, effects: [{ type: 'GaussianBlur', radius: 2 }] }, { type: 'text', at: [20, 40], text: 'Card', family: 'Arial', size: 14 }, { type: 'ellipse', box: [80, 20, 20, 20], fill: '#ff0000' }] }],
+    }),
+  );
+  assert.deepEqual(card, { created: [{ id: 'card', name: 'Card', children: [{ id: 'rect1', name: 'Rectangle' }, { id: 'text1', name: 'Card' }, { id: 'ellipse1', name: 'Circle' }] }], undoSteps: 1 });
+  const p1 = (await history(t)).position;
+  assert.equal(p1 - p0, 1);
+  const nested = jsonOf(
+    await t.call('create_nodes', { nodes: [{ type: 'layer', id: 'outer', children: [{ type: 'layer', id: 'inner', children: [{ type: 'ellipse', box: [200, 10, 40, 40] }] }, { type: 'rect', box: [250, 10, 40, 40] }] }] }),
+  );
+  assert.equal(nested.undoSteps, 2);
+  assert.equal((await history(t)).position - p1, 2);
+  const tree = jsonOf(await t.call('get_document', { depth: 4 })).nodes;
+  const ids = (n: TreeNode): unknown => (n.children ? { [n.id]: n.children.map(ids) } : n.id);
+  assert.deepEqual(tree.map(ids), [{ card: ['rect1', 'text1', 'ellipse1'] }, { outer: [{ inner: ['ellipse2'] }, 'rect2'] }]);
+});
+
+live('FR-306 FR-312 used IDs, unknown parents and missing fonts change nothing; fontFallback warns', async (ctx) => {
+  const t = await setup(ctx);
+  await makeDocument(t);
+  await t.call('create_nodes', { nodes: [{ type: 'rect', id: 'bg', box: [0, 0, 10, 10] }] });
+  const before = await history(t);
+  const refused = async (args: Record<string, unknown>, pattern: RegExp) => {
+    const r = await t.call('create_nodes', args);
+    assert.equal(r.isError, true, JSON.stringify(args));
+    assert.match(textOf(r), pattern);
+    assert.match(textOf(r), /Nothing was changed/);
+  };
+  await refused({ nodes: [{ type: 'rect', id: 'bg', box: [0, 0, 5, 5] }] }, /"bg" is already used/);
+  await refused({ nodes: [{ type: 'rect', box: [0, 0, 5, 5] }], parentId: 'nope' }, /parent "nope" was not found/);
+  await refused({ nodes: [{ type: 'text', at: [0, 50], text: 'x', family: 'Helvetica Neue XYZ' }] }, /"Helvetica Neue XYZ" is not installed; the closest installed families are ([^,]+, ){4}[^,]+\./);
+  await refused({ nodes: [{ type: 'text', at: [0, 50], text: 'x', family: 'Arial', style: 'Ultra' }] }, /Style "Ultra" of "Arial" is not installed; its styles are .*Bold/);
+  assert.deepEqual(await history(t), before);
+  const r = jsonOf(await t.call('create_nodes', { nodes: [{ type: 'text', at: [0, 50], text: 'x', family: 'Helvetica Neue XYZ' }], fontFallback: true }));
+  assert.match(r.warnings[0], /Affinity substitutes it/);
+});
+
+live('FR-305 writes on another spread switch to it within the same undo step', async (ctx) => {
+  const t = await setup(ctx);
+  await makeDocument(t, 'o.width = 400; o.height = 300; o.dpi = 72; o.isMultiPage = true; o.isFacing = false; o.pageCount = 2;');
+  const a = jsonOf(await t.call('create_nodes', { nodes: [{ type: 'rect', id: 'a', box: [0, 0, 10, 10] }] }));
+  assert.equal(a.spread, undefined);
+  const p0 = (await history(t)).position;
+  const b = jsonOf(await t.call('create_nodes', { nodes: [{ type: 'rect', id: 'b', box: [0, 0, 10, 10], fill: '#ff0000' }], spreadIndex: 1 }));
+  assert.equal(b.spread, 1);
+  assert.equal(jsonOf(await t.call('get_document')).document.currentSpread, 1);
+  const u = jsonOf(await t.call('update_nodes', { updates: [{ id: 'a', set: { fill: '#00ff00' } }] }));
+  assert.equal(u.spread, 0);
+  assert.equal((await history(t)).position - p0, 2);
+  const both = await t.call('update_nodes', { updates: [{ id: 'a', set: { name: 'x' } }, { id: 'b', set: { name: 'y' } }] });
+  assert.equal(both.isError, true);
+  assert.match(textOf(both), /more than one spread/);
+  assert.equal((await nodes(t, ['a']))[0].fill, '#00ff00ff');
+});
+
+live('FR-317 FR-318 FR-319 FR-320 FR-322 update_nodes changes every field in 1 undo step', async (ctx) => {
+  const t = await setup(ctx);
+  await makeDocument(t);
+  await t.call('create_nodes', {
+    nodes: [
+      { type: 'rect', id: 'r', box: [10, 10, 100, 50], fill: '#cccccc' },
+      { type: 'star', box: [150, 10, 80, 80], fill: '#ffcc00' },
+      { type: 'text', id: 'txt', at: [20, 200], text: 'Old', family: 'Arial', size: 12 },
+      { type: 'text', id: 'frame', kind: 'frame', box: [200, 150, 200, 100], text: 'Frame' },
+      { type: 'shape', id: 'poly', kind: 'Polygon', sides: 6, box: [450, 10, 80, 80], fill: '#00ffff' },
+    ],
+  });
+  await t.call('run_script', { code: ADD_RECT });
+  const plain = jsonOf(await t.call('get_document')).nodes.at(-1).id;
+  assert.match(plain, /^0\/\d+$/);
+  const p0 = (await history(t)).position;
+  const r = jsonOf(
+    await t.call('update_nodes', {
+      updates: [
+        { id: 'r', set: { name: 'Renamed', box: [100, 100, 200, 50], fill: { gradient: 'Linear', stops: [{ at: 0, color: '#ffffff' }, { at: 1, color: '#000000' }] }, stroke: { color: '#ff0000', width: 3, cap: 'Round', join: 'Bevel', dash: [2, 1], align: 'Inside' }, opacity: 0.8, blendMode: 'Screen', effects: [{ type: 'InnerShadow', radius: 3 }], cornerRadius: 8 } },
+        { id: 'star1', set: { points: 7, rotation: 45 } },
+        { id: plain, set: { fill: '#00ff00', hidden: true, locked: true } },
+        { id: 'txt', set: { runs: [{ text: 'Hello ', family: 'Arial', style: 'Bold', size: 20 }, { text: 'World', family: 'Georgia', size: 16, color: '#ff0000' }] } },
+        { id: 'frame', set: { text: 'One\nTwo', align: ['Right', 'Centre'] } },
+        { id: 'poly', set: { sides: 5 } },
+      ],
+    }),
+  );
+  assert.equal(r.undoSteps, 1);
+  assert.equal((await history(t)).position - p0, 1);
+  assert.deepEqual(r.updated.slice(0, 2), [{ id: 'r' }, { id: 'star1' }]);
+  assert.deepEqual(r.updated[2], { id: 'rect1', was: plain });
+  const [rect, star, green, txt, frame] = await nodes(t, ['r', 'star1', 'rect1', 'txt', 'frame']);
+  assert.deepEqual([rect.name, rect.box, rect.fill.gradient, rect.opacity, rect.blendMode], ['Renamed', [100, 100, 200, 50], 'Linear', 0.8, 'Screen']);
+  assert.deepEqual(rect.stroke, { color: '#ff0000ff', width: 3, align: 'Inside', cap: 'Round', join: 'Bevel', dash: [2, 1] });
+  assert.equal(rect.effects[0].type, 'InnerShadow');
+  assert.equal(star.rotation, 45);
+  assert.deepEqual([green.fill, green.hidden, green.locked], ['#00ff00ff', true, true]);
+  assert.deepEqual(
+    txt.text.runs.map((x: { text: string; family: string; style: string; size: number }) => [x.text, x.family, x.style, x.size]),
+    [
+      ['Hello ', 'Arial', 'Bold', 20],
+      ['World', 'Georgia', 'Regular', 16],
+    ],
+  );
+  assert.deepEqual([frame.text.content, frame.text.align], ['One\nTwo', ['Right', 'Centre']]);
+  // Partial stroke, removal, moves of text, refusals.
+  await t.call('update_nodes', { updates: [{ id: 'r', set: { stroke: { width: 6 } } }] });
+  assert.deepEqual((await nodes(t, ['r']))[0].stroke, { color: '#ff0000ff', width: 6, align: 'Inside', cap: 'Round', join: 'Bevel', dash: [2, 1] });
+  await t.call('update_nodes', { updates: [{ id: 'r', set: { stroke: null, fill: null, effects: [] } }] });
+  const bare = (await nodes(t, ['r']))[0];
+  assert.deepEqual([bare.stroke, bare.fill, bare.effects], [null, null, undefined]);
+  const p1 = (await history(t)).position;
+  const resize = await t.call('update_nodes', { updates: [{ id: 'txt', set: { box: [0, 0, 500, 500] } }] });
+  assert.match(textOf(resize), /can only be moved/);
+  const unknown = await t.call('update_nodes', { updates: [{ id: 'r', set: { name: 'z' } }, { id: 'ghost', set: { name: 'z' } }] });
+  assert.match(textOf(unknown), /No node has the ID "ghost"/);
+  assert.equal((await history(t)).position, p1);
+  const box = txt.box;
+  await t.call('update_nodes', { updates: [{ id: 'txt', set: { box: [box[0] + 10, box[1] + 5, box[2], box[3]] } }] });
+  const moved = (await nodes(t, ['txt']))[0].box;
+  assert.ok(Math.abs(moved[0] - box[0] - 10) < 0.01 && Math.abs(moved[1] - box[1] - 5) < 0.01, `${moved}`);
+});
+
+live('FR-321 move reorders nodes and moves them between parents', async (ctx) => {
+  const t = await setup(ctx);
+  await makeDocument(t);
+  await t.call('create_nodes', { nodes: [{ type: 'layer', id: 'L', children: [{ type: 'rect', id: 'a', box: [0, 0, 5, 5] }, { type: 'rect', id: 'b', box: [0, 0, 5, 5] }, { type: 'rect', id: 'c', box: [0, 0, 5, 5] }] }, { type: 'layer', id: 'M', children: [{ type: 'rect', id: 'm', box: [0, 0, 5, 5] }] }] });
+  const order = async () => jsonOf(await t.call('get_document', { depth: 3 })).nodes.map((n: TreeNode) => (n.children ? { [n.id]: n.children.map((c) => c.id) } : n.id));
+  await t.call('update_nodes', { updates: [{ id: 'c', move: { index: 0 } }] });
+  assert.deepEqual(await order(), [{ L: ['c', 'a', 'b'] }, { M: ['m'] }]);
+  await t.call('update_nodes', { updates: [{ id: 'a', move: { parentId: 'M' } }] });
+  assert.deepEqual(await order(), [{ L: ['c', 'b'] }, { M: ['m', 'a'] }]);
+  await t.call('update_nodes', { updates: [{ id: 'b', move: { parentId: '0', index: 0 } }] });
+  assert.deepEqual(await order(), ['b', { L: ['c'] }, { M: ['m', 'a'] }]);
+});
+
+live('FR-302 a failure after changes restores the document', async (ctx) => {
+  const t = await setup(ctx);
+  await makeDocument(t);
+  await t.call('create_nodes', { nodes: [{ type: 'rect', id: 'keep', box: [0, 0, 10, 10] }] });
+  const before = await history(t);
+  const r = await t.call('run_script', {
+    code: `${ADD_RECT.replace("const doc = app.documents.current;", "const doc = app.documents.current; ttam.atomic(doc, () => {")} throw new Error('late failure'); });`,
+  });
+  assert.equal(r.isError, true);
+  assert.match(textOf(r), /late failure[\s\S]*restored/);
+  const after = await history(t);
+  assert.deepEqual([after.position, after.top], [before.position, before.top]);
+});
+
+live('FR-323 FR-324 delete_nodes removes nodes in 1 step; undo and redo walk the history', async (ctx) => {
+  const t = await setup(ctx);
+  await makeDocument(t);
+  const start = await history(t);
+  const made = jsonOf(await t.call('create_nodes', { nodes: [{ type: 'layer', id: 'L', children: [{ type: 'layer', id: 'L2', children: [{ type: 'rect', id: 'x', box: [0, 0, 5, 5] }] }] }, { type: 'rect', id: 'y', box: [0, 0, 5, 5] }] }));
+  assert.equal(made.undoSteps, 2);
+  const p0 = (await history(t)).position;
+  const d = jsonOf(await t.call('delete_nodes', { ids: ['L', 'x', 'y'] }));
+  assert.deepEqual(d, { deleted: 3, undoSteps: 1 });
+  assert.deepEqual(await history(t), { position: p0 + 1, top: start.top });
+  const unknown = await t.call('delete_nodes', { ids: ['nope'] });
+  assert.match(textOf(unknown), /No node has the ID "nope"/);
+  const one = jsonOf(await t.call('undo'));
+  assert.equal(one.done, 1);
+  assert.match(one.redo, /^Delete/);
+  assert.equal((await history(t)).top, start.top + 2);
+  const two = jsonOf(await t.call('undo', { steps: 2 }));
+  assert.equal(two.done, 2);
+  assert.equal((await history(t)).top, start.top);
+  const r = jsonOf(await t.call('undo', { steps: 2, redo: true }));
+  assert.equal(r.done, 2);
+  assert.equal((await history(t)).top, start.top + 2);
+  const all = jsonOf(await t.call('undo', { steps: 100 }));
+  assert.deepEqual([all.position, all.undo, typeof all.redo], [0, null, 'string']);
+  assert.ok(all.done < 100);
+});
+
+live('FR-325 FR-326 get_nodes ignores dash patterns of solid lines and scales text sizes with the node', async (ctx) => {
+  const t = await setup(ctx);
+  await makeDocument(t);
+  await t.call('run_script', {
+    code: `const { app } = require('/application.js'); const N = require('/nodes.js'); const { AddChildNodesCommandBuilder, DocumentCommand } = require('/commands.js'); const S = require('/shapes.js'); const { Rectangle, Transform } = require('/geometry.js'); const { Colour } = require('/colours.js'); const L = require('/linestyle.js'); const { StoryBuilder } = require('/storybuilder.js');
+const doc = app.documents.current;
+const b = AddChildNodesCommandBuilder.create();
+b.addNode(N.ShapeNodeDefinition.create(S.ShapeRectangle.create(), new Rectangle(10, 10, 50, 50), Colour.createRGBA8({ r: 0, g: 0, b: 0, alpha: 255 }), Colour.createRGBA8({ r: 0, g: 0, b: 0, alpha: 255 }), L.LineStyleDescriptor.create(L.LineStyle.create({ weight: 2 }))));
+const sb = StoryBuilder.create(); sb.setToArtisticTextDefaultStyle(doc.dpi); sb.addText('Scaled');
+b.addNode(N.ArtTextNodeDefinition.createFromStoryBuilder({ x: 100, y: 100 }, sb));
+b.setInsertionTarget(doc.currentSpread);
+doc.executeCommand(b.createCommand(false, N.NodeChildType.Main));
+const text = doc.currentSpread.children.toArray()[1];
+const box = text.spreadBaseBox;
+doc.executeCommand(DocumentCommand.createTransform(text.selfSelection, Transform.multiply(Transform.createTranslate(box.x, box.y), Transform.multiply(Transform.createScale(2, 2), Transform.createTranslate(-box.x, -box.y)))));`,
+  });
+  const [rect, text] = await nodes(t, ['0/0', '0/1']);
+  assert.equal(rect.stroke.width, 2);
+  assert.equal('dash' in rect.stroke, false);
+  assert.equal(text.text.runs[0].size, 24);
+});
+
+live('FR-304 without an open document the write tools fail', async (ctx) => {
+  const t = await setup(ctx);
+  if (jsonOf(await t.call('get_status')).documents.length > 0) return ctx.skip('documents are open in Affinity');
+  for (const [tool, args] of [['create_nodes', { nodes: [{ type: 'rect', box: [0, 0, 5, 5] }] }], ['update_nodes', { updates: [{ id: 'a', set: { name: 'b' } }] }], ['delete_nodes', { ids: ['a'] }], ['undo', {}]] as const) {
+    assert.match(textOf(await t.call(tool, args)), /No document is open/, tool);
+  }
+});
+
+live('NFR-301 NFR-302 200 nodes are created within 3 s; the result for 100 nodes stays below 8,000 characters', async (ctx) => {
+  const t = await setup(ctx);
+  await makeDocument(t, 'o.width = 2000; o.height = 2000; o.dpi = 72;');
+  const many = (n: number) => Array.from({ length: n }, (_, i) => ({ type: 'rect', box: [(i % 20) * 50, Math.floor(i / 20) * 50, 40, 40], fill: '#336699' }));
+  const t0 = performance.now();
+  const r = await t.call('create_nodes', { nodes: many(200) });
+  const ms = performance.now() - t0;
+  assert.equal(jsonOf(r).created.length, 200);
+  assert.ok(ms < 3000, `${Math.round(ms)} ms`);
+  const hundred = textOf(await t.call('create_nodes', { nodes: many(100) }));
+  assert.ok(hundred.length < 8000, `${hundred.length} characters`);
+});
