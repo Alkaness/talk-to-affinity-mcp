@@ -50,8 +50,8 @@ async function refused(fn: () => Promise<CallToolResult>) {
 
 // 1. Package
 
-test('NFR-101 runtime dependencies are exactly the MCP SDK and zod', () => {
-  assert.deepEqual(Object.keys(pkg.dependencies).sort(), ['@modelcontextprotocol/sdk', 'zod']);
+test('NFR-101 runtime dependencies are exactly the MCP SDK, zod, pngjs and jpeg-js', () => {
+  assert.deepEqual(Object.keys(pkg.dependencies).sort(), ['@modelcontextprotocol/sdk', 'jpeg-js', 'pngjs', 'zod']);
 });
 
 test('NFR-102 the package declares Node 20 or later', () => {
@@ -414,7 +414,7 @@ test('FR-129 FR-131 the executable speaks MCP on stdout only and exits when stdi
   await next();
   send({ jsonrpc: '2.0', method: 'notifications/initialized' });
   send({ jsonrpc: '2.0', id: 2, method: 'tools/list' });
-  assert.deepEqual((await next()).result.tools.map((x: { name: string }) => x.name).sort(), ['create_nodes', 'delete_nodes', 'export', 'get_document', 'get_nodes', 'get_status', 'list_fonts', 'manage_document', 'render', 'run_script', 'sdk_docs', 'undo', 'update_nodes']);
+  assert.deepEqual((await next()).result.tools.map((x: { name: string }) => x.name).sort(), ['compare_to_reference', 'create_nodes', 'delete_nodes', 'export', 'get_document', 'get_nodes', 'get_status', 'list_fonts', 'manage_document', 'render', 'run_script', 'sdk_docs', 'undo', 'update_nodes']);
   send({ jsonrpc: '2.0', id: 3, method: 'tools/call', params: { name: 'get_status', arguments: {} } });
   assert.equal(JSON.parse((await next()).result.content[0].text).connected, true);
   for (const l of seen) assert.doesNotThrow(() => JSON.parse(l));

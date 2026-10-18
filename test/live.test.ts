@@ -1128,3 +1128,109 @@ live('NFR-401 FR-404 a 200-node spread exports at 2,048 px within 2 s and no sta
   const host = jsonOf(await t.call('get_status')).files.hostDesktop;
   assert.ok(!existsSync(join(host, 'talk-to-affinity')), 'staging folder removed');
 });
+
+// Slice 005: visual compare. References lie in temporary host folders.
+
+const POSTER = [
+  { type: 'rect', id: 'bg', box: [0, 0, 1200, 800], fill: { gradient: 'Linear', angle: 90, stops: [{ at: 0, color: '#1e2a78' }, { at: 1, color: '#ff6f61' }] } },
+  { type: 'text', id: 'title', text: 'Summer Festival', at: [80, 180], family: 'DejaVu Sans', style: 'Bold', size: 72, color: '#ffffff' },
+  { type: 'ellipse', id: 'sun', box: [820, 120, 260, 260], fill: '#ffd166' },
+  { type: 'star', id: 'star', box: [140, 420, 200, 200], fill: '#06d6a0' },
+  { type: 'rect', id: 'card', box: [420, 460, 300, 160], fill: '#118ab2', stroke: { color: '#ffffff', width: 6 } },
+  { type: 'path', id: 'wave', d: 'M 800 650 C 900 450 1000 750 1120 560', stroke: { color: '#ffffff', width: 8 } },
+];
+const poster = async (t: T) => {
+  await make(t, { width: 1200, height: 800 });
+  const r = await t.call('create_nodes', { nodes: POSTER });
+  assert.equal(r.isError, undefined, textOf(r));
+};
+type Compared = { score: number; diffRatio: number; render: string; size: number[]; area: number[]; reference: number[]; regions: { box: number[]; diffRatio: number }[]; note?: string };
+const compare = async (t: T, args: Record<string, unknown>) => {
+  const r = await t.call('compare_to_reference', args);
+  assert.equal(r.isError, undefined, textOf(r));
+  return { ...(jsonOf(r) as Compared), images: r.content.filter((c) => c.type === 'image') as { data: string; mimeType: string }[] };
+};
+const overlaps = (a: number[], b: number[]) => a[0] < b[0] + b[2] && b[0] < a[0] + a[2] && a[1] < b[1] + b[3] && b[1] < a[1] + a[3];
+
+live('FR-503 FR-505 FR-507 FR-508 FR-510 a poster matches its own export; a moved shape is found; the document stays unchanged', async (ctx) => {
+  const t = await setup(ctx);
+  const out = temp();
+  await poster(t);
+  const ref = (await exported(t, { path: join(out, 'ref.png'), width: 1024 })).files[0];
+  const before = await state(t);
+  const same = await compare(t, { reference: ref.path });
+  assert.deepEqual(
+    { score: same.score, diffRatio: same.diffRatio, render: same.render, size: same.size, area: same.area, reference: same.reference, regions: same.regions },
+    { score: 1, diffRatio: 0, render: 'png', size: [1024, 683], area: [0, 0, 1200, 800], reference: [1024, 683], regions: [] },
+  );
+  assert.equal(same.images.length, 1);
+  assert.deepEqual(jpegSize(Buffer.from(same.images[0].data, 'base64')), { width: 1024, height: 683 });
+  assert.deepEqual(await state(t), before);
+  await t.call('update_nodes', { updates: [{ id: 'sun', set: { box: [860, 120, 260, 260] } }] });
+  const moved = await compare(t, { reference: ref.path });
+  assert.ok(moved.diffRatio > 0.01 && moved.score < 1, JSON.stringify(moved.diffRatio));
+  assert.equal(moved.regions.length, 5);
+  for (const r of moved.regions) assert.ok(overlaps(r.box, [820, 120, 260, 260]) || overlaps(r.box, [860, 120, 260, 260]), JSON.stringify(r));
+  await done(t);
+});
+
+live('FR-503 FR-505 a node is compared with its own export, cut to its visible box', async (ctx) => {
+  const t = await setup(ctx);
+  const out = temp();
+  await poster(t);
+  const ref = (await exported(t, { path: join(out, 'star.png'), target: 'nodes', ids: ['star'] })).files[0];
+  const before = await state(t);
+  const r = await compare(t, { reference: ref.path, target: 'nodes', ids: ['star'], heatmap: false });
+  assert.deepEqual([r.diffRatio, r.area, r.size, r.images.length], [0, [140, 420, 200, 200], [ref.width, ref.height], 0]);
+  assert.deepEqual(await state(t), before);
+  await done(t);
+});
+
+live('FR-506 an 800 x 800 px reference needs fit; stretch and contain compare it', async (ctx) => {
+  const t = await setup(ctx);
+  const out = temp();
+  await poster(t);
+  const square = join(out, 'square.png');
+  writeFileSync(square, png(800, 800, [255, 255, 255, 255]));
+  const refused = await t.call('compare_to_reference', { reference: square });
+  assert.equal(refused.isError, true);
+  assert.match(textOf(refused), /800 x 800 px and the target area is 1200 x 800 document pixels.*fit/);
+  const stretched = await compare(t, { reference: square, fit: 'stretch' });
+  assert.deepEqual(stretched.size, [800, 533]);
+  const contained = await compare(t, { reference: square, fit: 'contain' });
+  assert.deepEqual(contained.size, [533, 533]);
+  assert.ok(Math.abs(contained.area[0] - 199.5) < 0.01 && contained.area[3] === 800, JSON.stringify(contained.area));
+  assert.ok(contained.regions.every((r) => r.box[0] >= 199 && r.box[0] + r.box[2] <= 1000), 'regions lie in the compared part');
+  await done(t);
+});
+
+live('FR-509 Affinity\'s render saved as JPEG differs from the PNG render in less than 1% of pixels', async (ctx) => {
+  const t = await setup(ctx);
+  const out = temp();
+  await poster(t);
+  const shot = (await t.call('render')).content.find((c) => c.type === 'image') as { data: string };
+  const native = join(out, 'native.jpg');
+  writeFileSync(native, Buffer.from(shot.data, 'base64'));
+  const r = await compare(t, { reference: native });
+  assert.equal(r.render, 'png');
+  assert.deepEqual(r.reference, [1024, 682]);
+  assert.ok(r.diffRatio < 0.01, `diffRatio ${r.diffRatio}`);
+  console.error(`FR-509 diffRatio ${r.diffRatio}, score ${r.score}`);
+  await done(t);
+});
+
+live('NFR-501 NFR-502 a comparison takes less than 2 s at 1,024 px and 4 s at 2,048 px', async (ctx) => {
+  const t = await setup(ctx);
+  const out = temp();
+  await poster(t);
+  for (const [size, limit] of [[1024, 2000], [2048, 4000]]) {
+    const ref = (await exported(t, { path: join(out, `ref${size}.png`), width: size })).files[0];
+    const t0 = performance.now();
+    const r = await compare(t, { reference: ref.path, maxSize: size });
+    const ms = performance.now() - t0;
+    assert.equal(r.size[0], size);
+    assert.ok(ms < limit, `${size} px: ${Math.round(ms)} ms`);
+    console.error(`NFR at ${size} px: ${Math.round(ms)} ms`);
+  }
+  await done(t);
+});

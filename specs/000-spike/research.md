@@ -412,3 +412,44 @@ Measured 2026-10-18 by the slice 004 live suite and a timing script through the 
 3. A document loaded from a copy in the staging folder and saved by `doc.save()` writes the copy; closing it in a separate script did not crash Affinity.
 4. A PNG export of a 1,000 x 1,000 px spread with 200 ellipses at 2,048 x 2,048 px took 555 to 840 ms through the server (staging, export and copy); a JPEG export of one node at 2,048 x 1,024 px for `render` took 517 to 538 ms.
 
+
+## 9. Slice 005 facts (2026-10-18, same build)
+
+Measured with a probe run through the server's own tools (`render`, `export`, `run_script`); each probe created its own documents and closed them in a separate call. Images were decoded with `pngjs` 7.0.0 and `jpeg-js` 0.4.4 on Node 22.19.0 and compared over white by the largest difference of the red, green and blue values of each pixel (0 to 255).
+
+### R-57 Geometry of Affinity's renderer
+
+1. `render_spread` does not enlarge: documents of 400 x 300, 200 x 100 and 64 x 64 px render at exactly their size. A 1,200 x 800 px document renders at 1,024 x 682 px and a 3,000 x 1,000 px document at 1,024 x 341 px: the longest side is 1,024 px and the other side is rounded down.
+2. The image starts at the page's top-left corner, and both axes share one scale. Against PNG exports of the same 1,200 x 800 px spread, the render matched a 1,024 x 683 px export cut to 682 rows (largest difference 64, 0.176% of pixels above 32) better than a 1,024 x 682 px export stretched to that size (126, 0.385%). The last partial row is cut, not stretched.
+3. In a document with a transparent background the renderer paints transparent areas white; a PNG export keeps them transparent (R-48 item 5).
+4. Consequence: a native render maps to document pixels by one scale, 1,024 divided by the longer side of the page, or 1 for pages of at most 1,024 px.
+
+### R-58 Noise between renders
+
+Fixture: a 1,200 x 800 px poster with a linear gradient background, two lines of DejaVu Sans text (72 pt bold and 28 pt), an ellipse, a star, a rectangle with a 6 px stroke and a cubic path with an 8 px stroke, compared at 1,024 x 682 px with the PNG export as the base.
+
+| Image compared with the PNG export | 99th percentile | Largest | Above 16 | Above 32 | Above 48 |
+|---|---|---|---|---|---|
+| The same PNG export repeated | 0 | 0 | 0% | 0% | 0% |
+| Affinity's render (JPEG) | 11 | 64 | 0.512% | 0.176% | 0.077% |
+| Export with `JPEG (High quality)` | 11 | 56 | 0.244% | 0.004% | 0% |
+| Export with `JPEG (Low quality)` | 47 | 179 | 6.356% | 2.405% | 0.861% |
+| PNG at 2,048 x 1,364 px reduced by averaging 2 x 2 pixels | 3 | 48 | 0.089% | 0.009% | 0% |
+| PNG after moving the 260 px ellipse 40 px to the right | 156 | 193 | 2.233% | 2.210% | 2.193% |
+
+1. Per square cell, at a threshold of 32, the share of differing pixels between Affinity's render and the PNG export was at most 6.25% for 32 px cells and 3.13% for 64 px cells, in cells along the lower edge of the stroked rectangle (one row of edge pixels).
+2. After the ellipse moved, the 5 cells with the most differing pixels between the new render and the old PNG export held 83.5% to 97.4% (32 px cells) and 42.6% to 54.3% (64 px cells) differing pixels, all of them over the ellipse's old or new position.
+3. Consequence: a threshold of 32 absorbs the noise of Affinity's JPEG render, of high-quality JPEG references and of resampling, while a moved shape differs by more than 150. With 64 px cells at 1,024 px (16 cells along the longer side), noise stays below 3.5% of a cell and the moved shape ranks first.
+
+### R-59 Decoding cost and sizes
+
+1. Decoding took 27 ms for a 1,024 x 682 px PNG (412,278 bytes), 78 ms for a 2,048 x 1,364 px PNG, 38 ms for a 1,024 x 682 px JPEG export and 32 ms for Affinity's 1,024 x 682 px render (58,995 bytes), each the mean of 5 runs.
+
+### R-60 Slice 005 implementation checks
+
+Measured 2026-10-18 by the slice 005 live suite through the server.
+
+1. Affinity's render of the poster of R-58, saved as JPEG (1,024 x 682 px) and compared with a PNG render of the unchanged spread (1,024 x 683 px, the reference resampled to it): `diffRatio` 0.0033 and `score` 0.9933 at the default threshold of 32.
+2. A comparison of the 1,200 x 800 px poster with a 1,024 x 683 px PNG reference took 843 to 860 ms, and one at `maxSize: 2048` with a 2,048 x 1,365 px reference took 1,292 to 1,363 ms, each including the export, both decodes and the heatmap (two runs).
+3. A change of the title colour from `#ffffff` to `#ffe0e0` (a difference of 31) stayed below the default threshold and showed only in `score`, while the moved ellipse of R-58 item 2 filled the 5 regions.
+4. In one full live run, Affinity exited after the slice 003 test NFR-301, which creates 200 nodes; the test's cleanup closes its document in a separate script. Every later test found the endpoint closed. After a restart of Affinity the full suite passed. The cause was not established; it resembles the timing-dependent crash of R-46.

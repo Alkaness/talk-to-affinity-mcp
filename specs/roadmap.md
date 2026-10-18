@@ -49,7 +49,7 @@ Mechanisms:
 4. Connection. `AFFINITY_MCP_URL` when set; otherwise `http://127.0.0.1:6767/sse`, then `http://[::1]:6767/sse` (R-01). Lazy connect, silent preamble read once per session, one reconnect on session death, automatic retry only for read-only tools.
 5. Staging. The host path of Affinity's Desktop is found by a probe file written from a script. Override: `AFFINITY_DESKTOP_DIR`. Working folder: `<Desktop>/talk-to-affinity/`, because the sandbox refuses dot folders (R-09). Staged files are deleted after each call and the folder is removed when empty. A document opened or saved through `manage_document` is edited as a copy in `doc-<hex>/` beside an `origin.txt` with its host path; `save` writes the copy back, and the copy is written back if newer and removed once the document is closed (slice 004).
 
-## 4. Tool contract (v1: 14 tools; 13 after slice 004)
+## 4. Tool contract (v1: 14 tools)
 
 | Tool | Slice | Input | Output |
 |---|---|---|---|
@@ -66,7 +66,7 @@ Mechanisms:
 | `undo` | 003 | `steps`, `redo` | steps done, history position and size, next descriptions |
 | `manage_document` | 004 | `action` create/open/save/saveAs/close; `width`, `height`, `units`, `dpi`, `pages`, `transparent`; `path`, `overwrite`; `discardChanges` | current document, open count, notes, warnings |
 | `export` | 004 | `path` (format by extension), `preset`, `target` spread/nodes/selection/document, `spreadIndex`, `ids`, `scale` or `width` or `height`, `overwrite` | files with path, bytes and pixel size; preset |
-| `compare_to_reference` | 005 | `reference`, `target`, `ids`, `maxSize`, `threshold`, `fit` | score, diff ratio, worst regions, heatmap image |
+| `compare_to_reference` | 005 | `reference` (host PNG or JPEG), `target` spread/nodes, `spreadIndex`, `ids`, `maxSize`, `threshold`, `fit` stretch/contain, `heatmap` | score, diff ratio, render kind, compared size and area, reference size, up to 5 regions in document pixels, note; heatmap image |
 
 ## 5. Slice status
 
@@ -77,7 +77,7 @@ Mechanisms:
 | 002 | Read model: `get_document`, `get_nodes`, `list_fonts`; facts R-19 to R-31 | Done (2026-10-14): 57 unit and 23 live tests pass |
 | 003 | Write model: `create_nodes`, `update_nodes`, `delete_nodes`, `undo`; facts R-32 to R-45 | Done (2026-10-14): 20 unit and 11 live tests pass |
 | 004 | Files and export: `manage_document`, `export`, high-resolution `render`, `render` of chosen nodes, image nodes; facts R-46 to R-56 | Done (2026-10-18): 23 unit and 13 live tests pass |
-| 005 | Visual compare: `compare_to_reference` | Not started |
+| 005 | Visual compare: `compare_to_reference`; facts R-57 to R-60 | Done (2026-10-18): 9 unit and 5 live tests pass |
 | 006 | Release: README, CHANGELOG, package dry run, version 0.1.0 | Not started |
 
 ## 6. Slices
@@ -112,7 +112,7 @@ The key requirements of each slice are listed in the approved plan and become th
 2. 002 read model: FR-201 to FR-223 (reads never mutate, ID rules, compact tree with truncation, queries, boxes in document pixels, fills, strokes, effects, text runs, font list).
 3. 003 write model: FR-301 to FR-307 (one undo step, schema rejection before execution, no partial changes, tagged IDs mirroring input, explicit font failure with 5 suggestions, SVG path data including arcs, automatic spread switch).
 4. 004 files and export: FR-401 to FR-425 (host paths through a staging folder, permission error, document copies written back by save, guarded close and overwrite, export by preset and area, node and high-resolution render, image nodes, host paths in results).
-5. 005 visual compare: FR-501 to FR-505 (score, diff ratio, 5 worst regions, heatmap; aspect-ratio guard; regions in document pixels; fixture tests; JPEG-aware threshold).
+5. 005 visual compare: FR-501 to FR-511 (reference checks before any script, lossless PNG render with a JPEG fallback, unchanged document, aspect-ratio guard with stretch and contain, score and diff ratio, 5 worst cells in document pixels, measured default threshold, heatmap).
 6. 006 release: README with exact tool count and per-OS setup, CHANGELOG, `npm pack --dry-run`, version 0.1.0; the owner publishes to npm.
 
 ### 6.3 Backlog
@@ -129,4 +129,4 @@ Each item needs its own spec when pulled: swatches and text styles, artboard man
 | 4 | SDK changes between 3.x releases | Versions in `get_status`; SDK calls confined to `src/sdk.js` and builders; live suite per release |
 | 5 | Few fonts under Wine | Font count in `list_fonts`; explicit failure for missing fonts |
 | 6 | Desktop mapping fails under Wine | Probe file plus `AFFINITY_DESKTOP_DIR` |
-| 7 | JPEG noise skews compare scores | Measured default threshold; PNG path when file access is allowed |
+| 7 | JPEG noise skews compare scores | Resolved: default threshold 32 measured (R-58); lossless PNG render when file access is allowed |

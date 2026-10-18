@@ -118,7 +118,7 @@ As a user, I want the server to keep working after Affinity restarts, without re
 
 | ID | Requirement |
 |---|---|
-| NFR-101 | Runtime dependencies are exactly `@modelcontextprotocol/sdk` and `zod`. |
+| NFR-101 | Runtime dependencies are exactly `@modelcontextprotocol/sdk` and `zod`, plus `pngjs` and `jpeg-js` from slice 005 (constitution item 10). |
 | NFR-102 | The package runs on Node 20 or later. |
 | NFR-103 | With a live session, the server adds at most 50 ms to a call beyond Affinity's execution time. |
 | NFR-104 | The first call after server start completes within 2 s when Affinity is ready. |
@@ -162,3 +162,4 @@ Measured 2026-10-14: `npm test` 38 of 38 pass; `npm run test:live` 52 of 52 pass
 1. 2026-10-14, planning: FR-105 now also repeats a mutating call whose request never reached Affinity, and FR-130 was added. Reason: when the event stream drops, the SDK's EventSource reconnects by itself and switches to a new endpoint session that has not read the preamble; a call on that session is refused by the gate and has not run. Without these rules a restart of Affinity would make the next write fail with a false "may have run" message.
 2. 2026-10-14, planning: FR-131 added. Reason: the SDK's `StdioServerTransport` does not react to the end of standard input, and the open SSE session to Affinity would keep the process alive after the AI client exits, holding an Affinity session.
 3. 2026-10-18, slice 004: FR-126 reports document paths as host paths (FR-423) and adds `files` (FR-424).
+4. 2026-10-18, slice 005: NFR-101 admits `pngjs` and `jpeg-js`, which constitution item 10 provides for the visual compare.

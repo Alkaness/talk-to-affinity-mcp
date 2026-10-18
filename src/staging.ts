@@ -7,7 +7,7 @@ import { AffinityError, type Upstream } from './affinity.js';
 
 export const FOLDER = 'talk-to-affinity';
 export const ACCESS_FIX = 'Turn on Settings > Model Context Protocol > Access files on your Desktop in Affinity.';
-const LOCATE_FIX = "Set AFFINITY_DESKTOP_DIR to the host folder that Affinity calls its Desktop.";
+export const LOCATE_FIX = "Set AFFINITY_DESKTOP_DIR to the host folder that Affinity calls its Desktop.";
 const ORIGIN = 'origin.txt';
 const hex = () => randomBytes(4).toString('hex');
 const norm = (p: string) => p.replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase();

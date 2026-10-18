@@ -17,6 +17,7 @@ export interface FakeOptions {
   topics?: Record<string, string> | null; // null: "Listing failed."
   modules?: Record<string, unknown>; // stub SDK modules served to require()
   scriptDelayMs?: number;
+  renderImage?: string; // base64 JPEG for render_spread and render_selection
 }
 
 export interface FakeCall {
@@ -91,7 +92,7 @@ export async function startFake(options: FakeOptions = {}): Promise<Fake> {
         }
         case 'render_spread':
         case 'render_selection':
-          return { content: [{ type: 'image', mimeType: 'image/jpeg', data: 'ZmFrZQ==' }] };
+          return { content: [{ type: 'image', mimeType: 'image/jpeg', data: options.renderImage ?? 'ZmFrZQ==' }] };
         case 'search_sdk_hints':
           return text(`hint for: ${String(args.prompt)}`);
         default:

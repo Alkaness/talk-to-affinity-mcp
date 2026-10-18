@@ -1004,7 +1004,7 @@ var ttam = (() => {
       x1 = Math.max(x1, b.x + b.width);
       y1 = Math.max(y1, b.y + b.height);
     }
-    return x0 === Infinity ? null : [Math.ceil(x1) - Math.floor(x0), Math.ceil(y1) - Math.floor(y0)];
+    return x0 === Infinity ? null : [Math.floor(x0), Math.floor(y0), Math.ceil(x1) - Math.floor(x0), Math.ceil(y1) - Math.floor(y0)];
   }
 
   // export and render (plan 3.6): each export goes to <dir>/s<n>/<name>; the host renames and copies.
@@ -1016,16 +1016,16 @@ var ttam = (() => {
     if (names.indexOf(o.preset) < 0) return { fail: 'Unknown export preset "' + o.preset + '". The closest presets are ' + closest(names, o.preset).map((n) => '"' + n + '"').join(', ') + '.' };
     const options = FileExportOptions.createWithPresetName(o.preset);
     const spreads = doc.spreads.toArray();
-    const page = [doc.widthPixels, doc.heightPixels];
+    const page = [0, 0, doc.widthPixels, doc.heightPixels]; // the page starts at the spread origin (plan 005 risk 1)
     const jobs = [];
     let nodes = null;
     if (o.target === 'spread') {
       const i = o.spreadIndex === undefined ? Math.max(0, spreads.findIndex((s) => s.isSameNode(doc.currentSpread))) : o.spreadIndex;
       if (i >= spreads.length) return { fail: 'Spread ' + i + ' does not exist; the document has ' + spreads.length + ' spread(s), indexed from 0.' };
-      jobs.push({ area: FileExportArea.createForSpreads(String(i + 1)), wh: page }); // R-48 item 2: counted from 1
+      jobs.push({ area: FileExportArea.createForSpreads(String(i + 1)), box: page }); // R-48 item 2: counted from 1
     } else if (o.target === 'document') {
-      if (/^PDF/.test(o.preset)) jobs.push({ area: FileExportArea.createForWholeDocument(), wh: page });
-      else spreads.forEach((s, i) => jobs.push({ area: FileExportArea.createForSpreads(String(i + 1)), wh: page, n: i + 1 }));
+      if (/^PDF/.test(o.preset)) jobs.push({ area: FileExportArea.createForWholeDocument(), box: page });
+      else spreads.forEach((s, i) => jobs.push({ area: FileExportArea.createForSpreads(String(i + 1)), box: page, n: i + 1 }));
     } else {
       if (o.target === 'nodes') {
         const at = scan(doc, o.ids);
@@ -1038,11 +1038,11 @@ var ttam = (() => {
         nodes = doc.selection.nodes.toArray();
         if (!nodes.length) return { fail: 'Nothing is selected in the current document.' };
       }
-      const wh = area(nodes);
-      if (!wh) return { fail: 'The nodes have no visible extent to export.' };
-      jobs.push({ area: FileExportArea.createForSelection(null), wh }); // R-48 item 3: the current selection
+      const box = area(nodes);
+      if (!box) return { fail: 'The nodes have no visible extent to export.' };
+      jobs.push({ area: FileExportArea.createForSelection(null), box }); // R-48 item 3: the current selection
     }
-    const sized = jobs.map((j) => exportSize(j.wh[0], j.wh[1], o.size));
+    const sized = jobs.map((j) => exportSize(j.box[2], j.box[3], o.size));
     const bad = sized.find((s) => s.fail);
     if (bad) return bad;
     const before = o.target === 'nodes' ? doc.selection : null;
@@ -1054,7 +1054,7 @@ var ttam = (() => {
       if (before) preview(before);
       throw e;
     }
-    return { files: jobs.map((j, k) => Object.assign({ sub: 's' + k }, j.n ? { n: j.n } : {}, sized[k])) };
+    return { files: jobs.map((j, k) => Object.assign({ sub: 's' + k, area: j.box }, j.n ? { n: j.n } : {}, sized[k])) };
   }
 
   return { getDocument, getNodes, listFonts, createNodes, updateNodes, deleteNodes, undo, plan, nextId, matchFont, gradientData, rotationData, boxData, paragraphRanges, atomic, fileAccess, documentInfo, createDocument, openDocument, saveDocument, closeDocument, exportSize, exportFiles, imageData, multiply };

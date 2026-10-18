@@ -5,7 +5,8 @@ import { cpSync, existsSync, readdirSync, readFileSync, rmSync, statSync } from 
 import { basename, dirname, extname, join } from 'node:path';
 import { z } from 'zod';
 import { AffinityError, ScriptError, Upstream, VERSION } from './affinity.js';
-import { checkFolder, checkTarget, hostPath, Staging } from './staging.js';
+import { compareImages, decode, heatmap, type Image } from './compare.js';
+import { ACCESS_FIX, checkFolder, checkTarget, hostPath, LOCATE_FIX, Staging } from './staging.js';
 import { parsePath } from './svgpath.js';
 
 export const INSTRUCTIONS = `Talk to Affinity controls Affinity by Canva through Affinity's own MCP endpoint.
@@ -15,7 +16,7 @@ Workflow:
 2. Create, open, save and close documents with manage_document.
 3. Read before changing: get_document for the overview and layer tree, get_nodes for exact styling, list_fonts for installed fonts.
 4. Change it with create_nodes, update_nodes and delete_nodes. Each call is all or nothing and reports its undo steps; undo reverts them.
-5. After every visual change, call render and look at the image. Write files with export.
+5. After every visual change, call render and look at the image. To match a reference image, call compare_to_reference: its regions are in document pixels. Write files with export.
 6. Use run_script only for what the typed tools do not cover; look the SDK up with sdk_docs first.
 
 Rules:
@@ -47,7 +48,15 @@ const RENDER_INFO = `const d = require('/application.js').app.documents.current;
 if (!d) return null;
 const spreads = [...d.spreads];
 const current = d.currentSpread;
-return { id: d.sessionUuid, spreads: spreads.length, spread: Math.max(0, spreads.findIndex((s) => s.isSameNode(current))), selection: d.selection.length };`;
+return { id: d.sessionUuid, spreads: spreads.length, spread: Math.max(0, spreads.findIndex((s) => s.isSameNode(current))), selection: d.selection.length, width: d.widthPixels, height: d.heightPixels };`;
+interface RenderInfo {
+  id: string;
+  spreads: number;
+  spread: number;
+  selection: number;
+  width: number;
+  height: number;
+}
 
 const NO_DOCUMENT = 'No document is open in Affinity. Open or create one first.';
 const IDS =
@@ -301,6 +310,18 @@ export function createServer(upstream: Upstream): McpServer {
   };
   const read = async (call: string, readOnly = true): Promise<CallToolResult> => ok(await run(call, readOnly));
 
+  /** The current document's session and spreads for Affinity's renderer (FR-123). */
+  const renderInfo = async () => {
+    const info = (await upstream.runScript(RENDER_INFO, { readOnly: true, timeoutMs: 10000 })).result as RenderInfo | null;
+    if (!info) throw new AffinityError(NO_DOCUMENT);
+    return info;
+  };
+  const renderSpread = (info: RenderInfo, spreadIndex?: number) => {
+    const index = spreadIndex ?? info.spread;
+    if (index >= info.spreads) throw new AffinityError(`Spread ${index} does not exist; the document has ${info.spreads} spread(s), indexed from 0.`);
+    return upstream.call('render_spread', { document_session_uuid: info.id, spread_index: index }, { readOnly: true });
+  };
+
   server.registerTool(
     'get_status',
     {
@@ -419,15 +440,12 @@ export function createServer(upstream: Upstream): McpServer {
           return { content: [{ type: 'image', mimeType: 'image/jpeg', data: readFileSync(onlyFile(join(c.host, r.files[0].sub))).toString('base64') }] };
         });
       }
-      const info = (await upstream.runScript(RENDER_INFO, { readOnly: true, timeoutMs: 10000 })).result as { id: string; spreads: number; spread: number; selection: number } | null;
-      if (!info) return fail(NO_DOCUMENT);
+      const info = await renderInfo();
       if (target === 'selection') {
         if (!info.selection) return fail('Nothing is selected in the current document.');
         return upstream.call('render_selection', { document_session_uuid: info.id }, { readOnly: true });
       }
-      const index = spreadIndex ?? info.spread;
-      if (index >= info.spreads) return fail(`Spread ${index} does not exist; the document has ${info.spreads} spread(s), indexed from 0.`);
-      return upstream.call('render_spread', { document_session_uuid: info.id, spread_index: index }, { readOnly: true });
+      return renderSpread(info, spreadIndex);
     }),
   );
 
@@ -670,6 +688,60 @@ export function createServer(upstream: Upstream): McpServer {
         for (const x of out) cpSync(x.src, x.dest);
         return ok({ files: out.map((x) => ({ path: x.dest, bytes: statSync(x.dest).size, ...(raster ? { width: x.f.width, height: x.f.height } : {}) })), preset });
       });
+    }),
+  );
+
+  server.registerTool(
+    'compare_to_reference',
+    {
+      title: 'Compare to reference',
+      description:
+        "Compare the current document pixel by pixel with a reference image, to see how closely it matches a mockup or an earlier export and where it differs. reference: a PNG or JPEG file on this computer (absolute or ~). target: spread (default; spreadIndex, default the current spread, its page) or nodes (ids on one spread, cut to their visible box). Both images are compared over white at the smaller of maxSize (default 1,024) and the reference's longest side; their aspect ratios must match within 1% unless fit is stretch, or contain (the reference centred inside the render, only that part compared). A pixel differs when a colour channel differs by more than threshold (0 to 255, default 32, which absorbs JPEG noise). Returns score (1 minus the mean difference), diffRatio (share of differing pixels), up to 5 regions (the worst of 16 cells along the longer side) with box [x, y, width, height] in document pixels and diffRatio, and a heatmap image with differences in red unless heatmap is false. Renders a lossless PNG through Affinity's file access; without it, a spread is compared with Affinity's JPEG render and note says how to turn the access on. History, selection and the saved state are unchanged.",
+      inputSchema: {
+        reference: z.string().min(1),
+        target: z.enum(['spread', 'nodes']).default('spread'),
+        spreadIndex: z.number().int().min(0).optional(),
+        ids: z.array(z.string().min(1)).min(1).max(500).optional(),
+        maxSize: z.number().int().min(64).max(2048).default(1024),
+        threshold: z.number().int().min(0).max(255).default(32),
+        fit: z.enum(['stretch', 'contain']).optional(),
+        heatmap: z.boolean().default(true),
+      },
+      annotations: { readOnlyHint: true },
+    },
+    guarded(async (a) => {
+      if ((a.target === 'nodes') !== (a.ids !== undefined)) return fail('ids belongs to target nodes, and target nodes needs ids.');
+      if (a.spreadIndex !== undefined && a.target !== 'spread') return fail('spreadIndex applies only to target spread.');
+      const file = hostPath(a.reference);
+      if (!isFile(file)) return fail(`${file} does not exist.`);
+      const reference = decode(readFileSync(file), file); // FR-502: before any script
+      const longest = Math.min(a.maxSize, Math.max(reference.width, reference.height));
+      let note: string | undefined;
+      try {
+        await staging.begin();
+      } catch (e) {
+        // FR-504: without staging, a spread falls back to Affinity's renderer.
+        if (!(e instanceof AffinityError && (e.fix === ACCESS_FIX || e.fix === LOCATE_FIX)) || a.target !== 'spread') throw e;
+        note = `${e.message} Until then, Affinity's JPEG render is compared.`;
+      }
+      let shot: { image: Image; area: [number, number, number, number] };
+      if (!note) {
+        shot = await staging.withCall(async (c) => {
+          const r = await run(`ttam.exportFiles(${JSON.stringify({ target: a.target, spreadIndex: a.spreadIndex, ids: a.ids, preset: 'PNG', size: { longest }, dir: c.dir, name: 'compare.png' })})`);
+          return { image: decode(readFileSync(onlyFile(join(c.host, r.files[0].sub))), "Affinity's export"), area: r.files[0].area };
+        });
+      } else {
+        const info = await renderInfo();
+        const res = await renderSpread(info, a.spreadIndex);
+        const img = res.content.find((c) => c.type === 'image');
+        if (res.isError || !img || img.type !== 'image') throw new AffinityError(`Affinity's renderer failed: ${res.content.map((c) => ('text' in c ? c.text : '')).join('')}`);
+        const image = decode(Buffer.from(img.data, 'base64'), "Affinity's render");
+        shot = { image, area: [0, 0, info.width, (image.height * info.width) / image.width] }; // R-57: one scale, the partial last row cut
+      }
+      const r = compareImages(shot.image, reference, { area: shot.area, threshold: a.threshold, fit: a.fit, longest });
+      const out = ok({ score: r.score, diffRatio: r.diffRatio, threshold: a.threshold, render: note ? 'jpeg' : 'png', size: r.size, area: r.area, reference: [reference.width, reference.height], regions: r.regions, ...(note ? { note } : {}) });
+      if (a.heatmap) out.content.push({ type: 'image', mimeType: 'image/jpeg', data: heatmap(r.compared, r.deltas, a.threshold).toString('base64') });
+      return out;
     }),
   );
 
