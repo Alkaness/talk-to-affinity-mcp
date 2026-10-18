@@ -78,7 +78,7 @@ Mechanisms:
 | 003 | Write model: `create_nodes`, `update_nodes`, `delete_nodes`, `undo`; facts R-32 to R-45 | Done (2026-10-14): 20 unit and 11 live tests pass |
 | 004 | Files and export: `manage_document`, `export`, high-resolution `render`, `render` of chosen nodes, image nodes; facts R-46 to R-56 | Done (2026-10-18): 23 unit and 13 live tests pass |
 | 005 | Visual compare: `compare_to_reference`; facts R-57 to R-60 | Done (2026-10-18): 9 unit and 5 live tests pass |
-| 006 | Release: README, CHANGELOG, package dry run, version 0.1.0 | Not started |
+| 006 | Release: README, CHANGELOG, clean packing, version 0.1.0 | Done (2026-10-18): 14 unit and 1 live test pass; 11 files, 46.6 kB packed |
 
 ## 6. Slices
 
@@ -113,7 +113,7 @@ The key requirements of each slice are listed in the approved plan and become th
 3. 003 write model: FR-301 to FR-307 (one undo step, schema rejection before execution, no partial changes, tagged IDs mirroring input, explicit font failure with 5 suggestions, SVG path data including arcs, automatic spread switch).
 4. 004 files and export: FR-401 to FR-425 (host paths through a staging folder, permission error, document copies written back by save, guarded close and overwrite, export by preset and area, node and high-resolution render, image nodes, host paths in results).
 5. 005 visual compare: FR-501 to FR-511 (reference checks before any script, lossless PNG render with a JPEG fallback, unchanged document, aspect-ratio guard with stretch and contain, score and diff ratio, 5 worst cells in document pixels, measured default threshold, heatmap).
-6. 006 release: README with exact tool count and per-OS setup, CHANGELOG, `npm pack --dry-run`, version 0.1.0; the owner publishes to npm.
+6. 006 release: FR-601 to FR-613 (version 0.1.0 everywhere, clean build before packing, exact tarball contents, the tarball started over stdio, public publish, README sections with tool table, clients, variables, setup per operating system, privacy and troubleshooting, CHANGELOG); the owner publishes to npm.
 
 ### 6.3 Backlog
 

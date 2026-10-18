@@ -1,14 +1,23 @@
 {
   "name": "@alkaness/talk-to-affinity-mcp",
-  "version": "0.0.0",
+  "version": "0.1.0",
   "description": "MCP server for Affinity by Canva: typed, token-efficient tools over Affinity's native local MCP endpoint.",
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "affinity",
+    "affinity-by-canva",
+    "canva",
+    "design"
+  ],
   "license": "MIT",
   "type": "module",
   "bin": {
     "talk-to-affinity-mcp": "dist/src/index.js"
   },
   "files": [
-    "dist/src"
+    "dist/src",
+    "CHANGELOG.md"
   ],
   "engines": {
     "node": ">=20"
@@ -17,8 +26,16 @@
     "type": "git",
     "url": "git+https://github.com/Alkaness/talk-to-affinity-mcp.git"
   },
+  "homepage": "https://github.com/Alkaness/talk-to-affinity-mcp#readme",
+  "bugs": {
+    "url": "https://github.com/Alkaness/talk-to-affinity-mcp/issues"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
   "scripts": {
-    "build": "tsc && node -e \"require('fs').copyFileSync('src/sdk.js', 'dist/src/sdk.js')\"",
+    "build": "node -e \"require('fs').rmSync('dist', { recursive: true, force: true })\" && tsc && node -e \"require('fs').copyFileSync('src/sdk.js', 'dist/src/sdk.js')\"",
+    "prepack": "npm run build",
     "test": "npm run build && node --test --test-force-exit \"dist/test/**/*.test.js\"",
     "test:live": "npm run build && AFFINITY_LIVE=1 node --test --test-force-exit --test-concurrency=1 \"dist/test/**/*.test.js\""
   },
