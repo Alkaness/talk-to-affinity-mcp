@@ -161,3 +161,4 @@ Measured 2026-10-14: `npm test` 38 of 38 pass; `npm run test:live` 52 of 52 pass
 
 1. 2026-10-14, planning: FR-105 now also repeats a mutating call whose request never reached Affinity, and FR-130 was added. Reason: when the event stream drops, the SDK's EventSource reconnects by itself and switches to a new endpoint session that has not read the preamble; a call on that session is refused by the gate and has not run. Without these rules a restart of Affinity would make the next write fail with a false "may have run" message.
 2. 2026-10-14, planning: FR-131 added. Reason: the SDK's `StdioServerTransport` does not react to the end of standard input, and the open SSE session to Affinity would keep the process alive after the AI client exits, holding an Affinity session.
+3. 2026-10-18, slice 004: FR-126 reports document paths as host paths (FR-423) and adds `files` (FR-424).

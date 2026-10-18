@@ -1,8 +1,9 @@
 // Emulation of Affinity's native MCP endpoint for unit tests (research R-02 to R-05, R-16).
 // execute_script runs the received script in a Node vm context with stub SDK modules.
-import { readFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import http from 'node:http';
 import type { AddressInfo } from 'node:net';
+import { basename, dirname, extname, join } from 'node:path';
 import vm from 'node:vm';
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { SSEServerTransport } from '@modelcontextprotocol/sdk/server/sse.js';
@@ -218,6 +219,7 @@ export interface NodeProps {
   dash?: number[];
   lineType?: string; // default: Dash when dash is given, else Solid
   scale?: number; // uniform node scale
+  raster?: [width: number, height: number]; // pixel size of an image node (R-54)
   noBrush?: boolean; // an unfilled shape: hasBrushFill is false (R-44)
   hidden?: boolean;
   locked?: boolean;
@@ -264,6 +266,7 @@ export function fakeNode(cls: string, p: NodeProps = {}, kids: object[] = [], lo
     tagInterface: { hasKey: (k: string) => k in tags, getValueForKey: (k: string) => tags[k] },
     children: collection(kids),
     ...(p.shape ? { shapeType: en(p.shape) } : {}),
+    ...(p.raster ? { rasterWidth: p.raster[0], rasterHeight: p.raster[1] } : {}),
     ...(cls.endsWith('TextNode')
       ? {
           text,
@@ -358,4 +361,47 @@ export function fakeDocument(o: DocumentProps) {
       },
     },
   };
+}
+
+// Slice 004: files over a real folder that stands for Affinity's Desktop (research R-47 to R-52).
+
+export const PRESETS = ['PNG', 'JPEG (High quality)', 'WebP (Lossless, default)', 'GIF RGB', 'TIFF RGB 8-bit', 'PSD (preserve editability)', 'SVG (for export)', 'PDF (for export)', 'EPS (for export)', 'PDF (for print)', 'JPEG (Best quality)'];
+
+export interface FilesOptions {
+  desktop: string; // the path Affinity reports
+  toHost?: (p: string) => string; // where that path lies on the host (default: the same path)
+  access?: boolean;
+}
+
+/** Adds stub file, export and document modules to `modules`; doc.export writes a JSON record of its arguments. */
+export function fakeFiles(modules: Record<string, any>, doc: any, o: FilesOptions) {
+  const host = (p: string) => (o.toHost ?? ((x: string) => x))(p).replace(/\\/g, '/');
+  modules['/application.js'].app.userDesktopPath = o.desktop;
+  modules['/environment.js'] = { Environment: { sdkVersionStr: '0.1', permissions: { fileSystem: o.access ?? true, network: false, genAI: false }, fileSystemRoots: [o.desktop] } };
+  modules['/fs.js'] = {
+    FileSystemApi: { createDirectories: (p: string) => mkdirSync(host(p), { recursive: true }) },
+    File: {
+      create: (p: string) => {
+        if (!existsSync(dirname(host(p)))) throw new Error('NO_SUCH_FILE_OR_DIRECTORY');
+        return { writeString: (t: string) => writeFileSync(host(p), t), close() {} };
+      },
+    },
+  };
+  modules['/document.js'] = {
+    FileExportOptions: { allPresetNames: PRESETS, createWithPresetName: (preset: string) => ({ preset }) },
+    FileExportArea: { createForSpreads: (s: string) => ({ spreads: s }), createForWholeDocument: () => ({ whole: true }), createForSelection: () => ({ selection: true }) },
+    Document: {
+      load: (p: string) => {
+        if (!existsSync(host(p))) throw new Error('PERMISSION_DENIED');
+        return doc;
+      },
+    },
+  };
+  doc.export = (path: string, options: { preset: string }, area: { spreads?: string }, size: unknown) => {
+    // R-48 item 2: a spread area appends _1 to the name.
+    const file = area.spreads ? join(dirname(host(path)), basename(host(path), extname(path)) + '_1' + extname(path)) : host(path);
+    mkdirSync(dirname(file), { recursive: true });
+    writeFileSync(file, JSON.stringify({ preset: options.preset, area, size }));
+  };
+  return modules;
 }

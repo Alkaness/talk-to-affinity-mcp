@@ -47,25 +47,25 @@ Mechanisms:
 2. Node IDs. A node's `id` is its `ttam-id` tag when present, otherwise a path `<spread>/<child>/<child>`. Write tools tag every node they create or modify in the same command batch. Read tools never tag. If two nodes carry the same tag, the first in document order keeps the ID and the others report path IDs.
 3. Units. Document pixels at the document DPI, origin at the spread's top-left corner. Font sizes in points.
 4. Connection. `AFFINITY_MCP_URL` when set; otherwise `http://127.0.0.1:6767/sse`, then `http://[::1]:6767/sse` (R-01). Lazy connect, silent preamble read once per session, one reconnect on session death, automatic retry only for read-only tools.
-5. Staging. The host path of Affinity's Desktop is found by a probe file written from a script. Override: `AFFINITY_DESKTOP_DIR`. Working folder: `<Desktop>/talk-to-affinity/`, because the sandbox refuses dot folders (R-09). Staged files are deleted after each call and the folder is removed when empty.
+5. Staging. The host path of Affinity's Desktop is found by a probe file written from a script. Override: `AFFINITY_DESKTOP_DIR`. Working folder: `<Desktop>/talk-to-affinity/`, because the sandbox refuses dot folders (R-09). Staged files are deleted after each call and the folder is removed when empty. A document opened or saved through `manage_document` is edited as a copy in `doc-<hex>/` beside an `origin.txt` with its host path; `save` writes the copy back, and the copy is written back if newer and removed once the document is closed (slice 004).
 
-## 4. Tool contract (v1: 14 tools)
+## 4. Tool contract (v1: 14 tools; 13 after slice 004)
 
 | Tool | Slice | Input | Output |
 |---|---|---|---|
-| `get_status` | 001 | none | connection, versions, permissions, open documents, Desktop mapping; never throws |
+| `get_status` | 001, 004 | none | connection, versions, permissions, open documents with host paths, `files` (access, Desktop, host Desktop); never throws |
 | `run_script` | 001 | `code`, `mutates` (default true), `timeoutMs` | `result`, `logs` |
 | `sdk_docs` | 001 | `action` list/read/search/hints, `topic`, `query`, `lines` | text snippets |
 | `render` | 001, 004 | `target` spread/selection/nodes, `spreadIndex`, `ids`, `maxSize` | image |
 | `get_document` | 002 | `spreadIndex`, `depth`, `limit`, `query` | document info, spread and artboards, tree or matches, selection, fonts used |
-| `get_nodes` | 002 | `ids` | geometry, fills, strokes, effects, text runs |
+| `get_nodes` | 002, 004 | `ids` | geometry, fills, strokes, effects, text runs, image size |
 | `list_fonts` | 002 | `query`, `limit` | total count, families with faces |
-| `create_nodes` | 003, 004 | `nodes` (rect, ellipse, star, shape, path, text, layer), `parentId`, `spreadIndex`, `fontFallback` | created IDs mirroring the input tree, undo steps |
+| `create_nodes` | 003, 004 | `nodes` (rect, ellipse, star, shape, path, text, image, layer), `parentId`, `spreadIndex`, `fontFallback` | created IDs mirroring the input tree, undo steps |
 | `update_nodes` | 003 | `updates` [{`id`, `set`, `move`}], `fontFallback` | IDs per node, undo steps |
 | `delete_nodes` | 003 | `ids` | count, undo steps |
 | `undo` | 003 | `steps`, `redo` | steps done, history position and size, next descriptions |
-| `manage_document` | 004 | `action` create/open/save/saveAs/close | document info |
-| `export` | 004 | `target`, `ids`, `format`, `scale` or `dpi`, `path` | path, bytes |
+| `manage_document` | 004 | `action` create/open/save/saveAs/close; `width`, `height`, `units`, `dpi`, `pages`, `transparent`; `path`, `overwrite`; `discardChanges` | current document, open count, notes, warnings |
+| `export` | 004 | `path` (format by extension), `preset`, `target` spread/nodes/selection/document, `spreadIndex`, `ids`, `scale` or `width` or `height`, `overwrite` | files with path, bytes and pixel size; preset |
 | `compare_to_reference` | 005 | `reference`, `target`, `ids`, `maxSize`, `threshold`, `fit` | score, diff ratio, worst regions, heatmap image |
 
 ## 5. Slice status
@@ -76,7 +76,7 @@ Mechanisms:
 | 001 | Foundation: connection layer, `get_status`, `run_script`, `sdk_docs`, `render` | Done (2026-10-14): 38 unit and 14 live tests pass |
 | 002 | Read model: `get_document`, `get_nodes`, `list_fonts`; facts R-19 to R-31 | Done (2026-10-14): 57 unit and 23 live tests pass |
 | 003 | Write model: `create_nodes`, `update_nodes`, `delete_nodes`, `undo`; facts R-32 to R-45 | Done (2026-10-14): 20 unit and 11 live tests pass |
-| 004 | Files and export: `manage_document`, `export`, high-resolution `render`, `render` of chosen nodes, image nodes | Not started |
+| 004 | Files and export: `manage_document`, `export`, high-resolution `render`, `render` of chosen nodes, image nodes; facts R-46 to R-56 | Done (2026-10-18): 23 unit and 13 live tests pass |
 | 005 | Visual compare: `compare_to_reference` | Not started |
 | 006 | Release: README, CHANGELOG, package dry run, version 0.1.0 | Not started |
 
@@ -111,7 +111,7 @@ The key requirements of each slice are listed in the approved plan and become th
 1. 001 foundation: FR-101 to FR-109 (connect and preamble, unreachable error within 3 s, host fallback, reconnect and retry rules, timeout honesty, result and logs, docs search cap of 20 snippets, image content, MCP instructions under 1,500 characters).
 2. 002 read model: FR-201 to FR-223 (reads never mutate, ID rules, compact tree with truncation, queries, boxes in document pixels, fills, strokes, effects, text runs, font list).
 3. 003 write model: FR-301 to FR-307 (one undo step, schema rejection before execution, no partial changes, tagged IDs mirroring input, explicit font failure with 5 suggestions, SVG path data including arcs, automatic spread switch).
-4. 004 files and export: FR-401 to FR-405 (export through staging, permission error, copy-on-open outside the sandbox, guarded close, high-resolution render).
+4. 004 files and export: FR-401 to FR-425 (host paths through a staging folder, permission error, document copies written back by save, guarded close and overwrite, export by preset and area, node and high-resolution render, image nodes, host paths in results).
 5. 005 visual compare: FR-501 to FR-505 (score, diff ratio, 5 worst regions, heatmap; aspect-ratio guard; regions in document pixels; fixture tests; JPEG-aware threshold).
 6. 006 release: README with exact tool count and per-OS setup, CHANGELOG, `npm pack --dry-run`, version 0.1.0; the owner publishes to npm.
 

@@ -1,23 +1,28 @@
 // MCP server and tools (specs/001-foundation/plan.md section 2).
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
+import { cpSync, existsSync, readdirSync, readFileSync, rmSync, statSync } from 'node:fs';
+import { basename, dirname, extname, join } from 'node:path';
 import { z } from 'zod';
 import { AffinityError, ScriptError, Upstream, VERSION } from './affinity.js';
+import { checkFolder, checkTarget, hostPath, Staging } from './staging.js';
 import { parsePath } from './svgpath.js';
 
 export const INSTRUCTIONS = `Talk to Affinity controls Affinity by Canva through Affinity's own MCP endpoint.
 
 Workflow:
 1. Call get_status first. When it reports connected: false, give the user the fix it returns.
-2. Read before changing: get_document for the overview and layer tree, get_nodes for exact styling, list_fonts for installed fonts.
-3. Change it with create_nodes, update_nodes and delete_nodes. Each call is all or nothing and reports its undo steps; undo reverts them.
-4. After every visual change, call render and look at the image; compare it with a reference when the user gave one.
-5. Use run_script only for what the typed tools do not cover. It runs Affinity's JavaScript SDK; look the SDK up with sdk_docs first.
+2. Create, open, save and close documents with manage_document.
+3. Read before changing: get_document for the overview and layer tree, get_nodes for exact styling, list_fonts for installed fonts.
+4. Change it with create_nodes, update_nodes and delete_nodes. Each call is all or nothing and reports its undo steps; undo reverts them.
+5. After every visual change, call render and look at the image. Write files with export.
+6. Use run_script only for what the typed tools do not cover; look the SDK up with sdk_docs first.
 
 Rules:
 - All geometry is in document pixels, origin at the top-left corner of the spread.
 - Tools act on the current document. Scripts cannot switch documents; ask the user to activate another one when needed.
-- Scripts can read and write files only on the Desktop.`;
+- File paths are paths on this computer (absolute or ~). File tools need Settings > Model Context Protocol > Access files on your Desktop in Affinity. Opened files are edited as copies; save writes them back.
+- Existing files are replaced only with overwrite: true; close keeps unsaved changes unless discardChanges: true.`;
 
 const STATUS = `const { app } = require('/application.js');
 const { Environment } = require('/environment.js');
@@ -26,6 +31,7 @@ return {
   affinity: app.version,
   sdk: Environment.sdkVersionStr,
   platform: app.platformName,
+  desktop: app.userDesktopPath,
   permissions: Environment.permissions,
   roots: Environment.fileSystemRoots,
   documents: app.documents.all.map((d) => ({
@@ -121,10 +127,11 @@ interface Spec {
   family?: string;
   style?: string;
   children?: Spec[];
+  src?: string;
 }
 const nodeSchema: z.ZodType<Spec> = z
   .object({
-    type: z.enum(['rect', 'ellipse', 'star', 'shape', 'path', 'text', 'layer']),
+    type: z.enum(['rect', 'ellipse', 'star', 'shape', 'path', 'text', 'image', 'layer']),
     id: z.string().regex(/^[A-Za-z_][A-Za-z0-9_.:-]{0,63}$/, 'an id has 1 to 64 characters from A-Z a-z 0-9 _ . : - and starts with a letter or _').optional(),
     box: z.tuple([xy, xy, z.number().positive(), z.number().positive()]).optional(),
     at: z.tuple([xy, xy]).optional(),
@@ -132,6 +139,8 @@ const nodeSchema: z.ZodType<Spec> = z
     kind: z.string().optional(),
     d: z.string().min(1).max(200000).optional(),
     fillRule: z.enum(['nonzero', 'evenodd']).optional(),
+    src: z.string().min(1).optional(),
+    fit: z.enum(['contain', 'stretch']).optional(),
     ...common,
     get children(): z.ZodOptional<z.ZodArray<z.ZodType<Spec>>> {
       return z.array(nodeSchema).max(500).optional();
@@ -144,11 +153,15 @@ const nodeSchema: z.ZodType<Spec> = z
     const only = (field: string, types: string[], what = types.join(', ')) => {
       if ((n as Spec)[field] !== undefined && !types.includes(t)) issue(ctx, `${field} applies only to ${what}`);
     };
-    if ((SHAPED.includes(t) || frame) && !n.box) issue(ctx, `box is required for ${frame ? 'frame text' : t}`);
-    if (n.box && !(SHAPED.includes(t) || frame)) issue(ctx, 'box applies only to rect, ellipse, star, shape and frame text');
+    const boxed = SHAPED.includes(t) || frame || t === 'image';
+    if (boxed && !n.box) issue(ctx, `box is required for ${frame ? 'frame text' : t}`);
+    if (n.box && !boxed) issue(ctx, 'box applies only to rect, ellipse, star, shape, image and frame text');
     if (t === 'text' && !frame && !n.at) issue(ctx, 'art text needs at: the start of its first baseline');
     if (n.at && (t !== 'text' || frame)) issue(ctx, 'at applies only to art text');
-    only('rotation', [...STROKED, 'text'], 'nodes other than layers');
+    only('rotation', [...STROKED, 'text', 'image'], 'nodes other than layers');
+    only('src', ['image']);
+    only('fit', ['image']);
+    if (t === 'image' && !n.src) issue(ctx, 'image needs src, the path of an image file on this computer');
     only('fill', STROKED);
     only('stroke', STROKED);
     only('cornerRadius', ['rect']);
@@ -210,6 +223,32 @@ const prepare = (n: Spec): object => ({ ...n, ...(n.d ? { d: undefined, segments
 
 const WRITE_RULES = 'All or nothing: if any part fails, the document is restored and the error says so.';
 
+const isFile = (p: string) => existsSync(p) && statSync(p).isFile();
+/** The single file Affinity wrote into a folder; it may have appended _1 to the name (R-48). */
+function onlyFile(dir: string) {
+  const names = readdirSync(dir);
+  if (names.length !== 1) throw new AffinityError(`Affinity wrote ${names.length} files instead of 1.`);
+  return join(dir, names[0]);
+}
+
+// Spec table 3.8.
+const FORMATS: Record<string, { preset: string; raster: boolean }> = {
+  png: { preset: 'PNG', raster: true },
+  jpg: { preset: 'JPEG (High quality)', raster: true },
+  jpeg: { preset: 'JPEG (High quality)', raster: true },
+  webp: { preset: 'WebP (Lossless, default)', raster: true },
+  gif: { preset: 'GIF RGB', raster: true },
+  tif: { preset: 'TIFF RGB 8-bit', raster: true },
+  tiff: { preset: 'TIFF RGB 8-bit', raster: true },
+  psd: { preset: 'PSD (preserve editability)', raster: true },
+  svg: { preset: 'SVG (for export)', raster: false },
+  pdf: { preset: 'PDF (for export)', raster: false },
+  eps: { preset: 'EPS (for export)', raster: false },
+};
+const VECTOR = /^(SVG|PDF|EPS|EPUB|DWG|DXF|Enhanced Windows Metafile|Windows Metafile|Canva)/;
+const ACTION_FIELDS: Record<string, string[]> = { create: ['width', 'height', 'units', 'dpi', 'pages', 'transparent'], open: ['path'], save: [], saveAs: ['path', 'overwrite'], close: ['discardChanges'] };
+const FILE_RULES = "Paths are paths on this computer, absolute or starting with ~; this needs Affinity's Settings > Model Context Protocol > Access files on your Desktop.";
+
 const ok = (value: unknown): CallToolResult => ({ content: [{ type: 'text', text: typeof value === 'string' ? value : JSON.stringify(value) }] });
 const fail = (text: string): CallToolResult => ({ content: [{ type: 'text', text }], isError: true });
 
@@ -250,18 +289,35 @@ function numbered(lines: string[], from: number, to: number) {
 
 export function createServer(upstream: Upstream): McpServer {
   const server = new McpServer({ name: 'talk-to-affinity-mcp', version: VERSION }, { instructions: INSTRUCTIONS });
+  const staging = new Staging(upstream);
+
+  /** Runs one library call (plan 002 section 1): null means no document, {fail} a failed precondition; both throw. */
+  const run = async (call: string, readOnly = true): Promise<any> => {
+    const { result } = await upstream.runScript(`return ${call};`, { readOnly, timeoutMs: readOnly ? 30000 : 60000 });
+    if (result === null) throw new AffinityError(NO_DOCUMENT);
+    const failed = (result as { fail?: string }).fail;
+    if (failed) throw new AffinityError(failed);
+    return result;
+  };
+  const read = async (call: string, readOnly = true): Promise<CallToolResult> => ok(await run(call, readOnly));
 
   server.registerTool(
     'get_status',
     {
       title: 'Affinity status',
-      description: 'Report whether Affinity is reachable, its version, the script permissions and the open documents. Call this first; when connected is false, show the user the fix.',
+      description: "Report whether Affinity is reachable, its version, the script permissions, the open documents with their paths on this computer, and file access (files: whether it is on, Affinity's Desktop and that folder on this computer, or the fix). Call this first; when connected is false, show the user the fix.",
       annotations: { readOnlyHint: true },
     },
     async () => {
       try {
         const { result } = await upstream.runScript(STATUS, { readOnly: true, timeoutMs: 10000 });
-        return ok({ connected: true, url: upstream.url, server: `talk-to-affinity-mcp ${VERSION}`, ...(result as object) });
+        const { desktop, ...status } = result as { desktop: string; permissions: { fileSystem: boolean }; documents: { path: string | null }[] };
+        const located = await staging.begin().then(
+          (l) => ({ hostDesktop: l.host }),
+          (e) => ({ hostDesktop: null, fix: e instanceof AffinityError && e.fix ? e.fix : errorText(e) }),
+        ); // FR-424
+        for (const d of status.documents) d.path = staging.mapPath(d.path); // FR-423
+        return ok({ connected: true, url: upstream.url, server: `talk-to-affinity-mcp ${VERSION}`, ...status, files: { access: !!status.permissions.fileSystem, desktop, ...located } });
       } catch (e) {
         if (e instanceof AffinityError && e.fix) return ok({ connected: false, reason: e.reason, fix: e.fix });
         return ok({ connected: true, url: upstream.url, error: errorText(e) }); // reachable, but the status script failed or timed out
@@ -342,14 +398,27 @@ export function createServer(upstream: Upstream): McpServer {
     'render',
     {
       title: 'Render',
-      description: "Render a spread of the current document (default: the current spread) or the current selection as a JPEG image, longest side at most 1,024 px. Use it to check every visual change.",
+      description:
+        "Render a spread of the current document (default: the current spread), the current selection, or chosen nodes (target nodes with ids: only those nodes, cut to their visible box) as a JPEG image. Without maxSize, spread and selection render at most 1,024 px. With nodes or maxSize (64 to 2,048) the longest side is maxSize (default 1,024), small areas enlarged; this needs Affinity's file access. History, selection and the saved state are unchanged. Use it to check every visual change.",
       inputSchema: {
-        target: z.enum(['spread', 'selection']).default('spread'),
+        target: z.enum(['spread', 'selection', 'nodes']).default('spread'),
         spreadIndex: z.number().int().min(0).optional(),
+        ids: z.array(z.string().min(1)).min(1).max(500).optional(),
+        maxSize: z.number().int().min(64).max(2048).optional(),
       },
       annotations: { readOnlyHint: true },
     },
-    guarded(async ({ target, spreadIndex }) => {
+    guarded(async ({ target, spreadIndex, ids, maxSize }) => {
+      if ((target === 'nodes') !== (ids !== undefined)) return fail('ids belongs to target nodes, and target nodes needs ids.');
+      if (spreadIndex !== undefined && target !== 'spread') return fail('spreadIndex applies only to target spread.');
+      if (target === 'nodes' || maxSize !== undefined) {
+        // FR-419: through an export, with the document unchanged (plan 2.3).
+        await staging.begin();
+        return staging.withCall(async (c) => {
+          const r = await run(`ttam.exportFiles(${JSON.stringify({ target, spreadIndex, ids, preset: 'JPEG (High quality)', size: { longest: maxSize ?? 1024 }, dir: c.dir, name: 'render.jpg' })})`);
+          return { content: [{ type: 'image', mimeType: 'image/jpeg', data: readFileSync(onlyFile(join(c.host, r.files[0].sub))).toString('base64') }] };
+        });
+      }
       const info = (await upstream.runScript(RENDER_INFO, { readOnly: true, timeoutMs: 10000 })).result as { id: string; spreads: number; spread: number; selection: number } | null;
       if (!info) return fail(NO_DOCUMENT);
       if (target === 'selection') {
@@ -361,14 +430,6 @@ export function createServer(upstream: Upstream): McpServer {
       return upstream.call('render_spread', { document_session_uuid: info.id, spread_index: index }, { readOnly: true });
     }),
   );
-
-  /** Runs one library call (plan 002 section 1): null means no document, {fail} a failed precondition. */
-  const read = async (call: string, readOnly = true): Promise<CallToolResult> => {
-    const { result } = await upstream.runScript(`return ${call};`, { readOnly, timeoutMs: readOnly ? 30000 : 60000 });
-    if (result === null) return fail(NO_DOCUMENT);
-    const failed = (result as { fail?: string }).fail;
-    return failed ? fail(failed) : ok(result);
-  };
 
   server.registerTool(
     'get_document',
@@ -383,7 +444,14 @@ export function createServer(upstream: Upstream): McpServer {
       },
       annotations: { readOnlyHint: true },
     },
-    guarded(async (args) => read(`ttam.getDocument(${JSON.stringify(args)})`)),
+    guarded(async (args) => {
+      const r = await run(`ttam.getDocument(${JSON.stringify(args)})`);
+      if (r.document.path) {
+        await staging.tryLocate();
+        r.document.path = staging.mapPath(r.document.path); // FR-423
+      }
+      return ok(r);
+    }),
   );
 
   server.registerTool(
@@ -413,7 +481,7 @@ export function createServer(upstream: Upstream): McpServer {
     'create_nodes',
     {
       title: 'Create nodes',
-      description: `Create rectangles, ellipses, stars, named shapes, SVG paths, text and layers in the current document, in front of the parent's children and in the given order (back to front). parentId is a node ID or a spread index such as "0" for its top level (default: the current spread). ${WRITE_RULES} The call adds 1 undo step, plus 1 for each level at which a new layer contains another new layer; the result states undoSteps and mirrors the input with each node's stable ID: its id when given, otherwise one like rect3. Geometry is in document pixels: box is [x, y, width, height]; art text is placed by the start of its first baseline (at: [x, y]); frame text fills its box. Colours are "#rrggbb" or "#rrggbbaa"; gradients span the box ({gradient: "Linear", angle} or "Radial", stops: [{at, color}]); rotation is in degrees, clockwise, about the box centre (art text: about at); text size is in points; stroke width in pixels; dash lengths in stroke widths. Text uses text plus family, style, size, color, or runs [{text, family, style, size, color}]; "\\n" starts a paragraph; align is one value or one per paragraph. Fonts must be installed (list_fonts) unless fontFallback is true. d accepts SVG commands M L H V C S Q T A Z.`,
+      description: `Create rectangles, ellipses, stars, named shapes, SVG paths, text, images and layers in the current document, in front of the parent's children and in the given order (back to front). parentId is a node ID or a spread index such as "0" for its top level (default: the current spread). ${WRITE_RULES} The call adds 1 undo step, plus 1 for each level at which a new layer contains another new layer; the result states undoSteps and mirrors the input with each node's stable ID: its id when given, otherwise one like rect3. Geometry is in document pixels: box is [x, y, width, height]; art text is placed by the start of its first baseline (at: [x, y]); frame text fills its box. Colours are "#rrggbb" or "#rrggbbaa"; gradients span the box ({gradient: "Linear", angle} or "Radial", stops: [{at, color}]); rotation is in degrees, clockwise, about the box centre (art text: about at); text size is in points; stroke width in pixels; dash lengths in stroke widths. Text uses text plus family, style, size, color, or runs [{text, family, style, size, color}]; "\\n" starts a paragraph; align is one value or one per paragraph. Fonts must be installed (list_fonts) unless fontFallback is true. d accepts SVG commands M L H V C S Q T A Z. Images: src is the path of a PNG, JPEG, WebP, TIFF or GIF file on this computer, embedded into the document; fit contain (default) keeps its aspect centred in box, stretch fills box; this needs Affinity's file access.`,
       inputSchema: {
         nodes: nodesSchema,
         parentId: z.string().min(1).optional(),
@@ -421,7 +489,24 @@ export function createServer(upstream: Upstream): McpServer {
         fontFallback: z.boolean().default(false),
       },
     },
-    guarded(async (args) => read(`ttam.createNodes(${JSON.stringify({ ...args, nodes: args.nodes.map(prepare) })})`, false)),
+    guarded(async (args) => {
+      const nodes = args.nodes.map(prepare) as Spec[];
+      const go = () => read(`ttam.createNodes(${JSON.stringify({ ...args, nodes })})`, false);
+      const images: Spec[] = [];
+      const collect = (l: Spec[]) => l.forEach((n) => (n.type === 'image' ? images.push(n) : collect(n.children ?? [])));
+      collect(nodes);
+      if (!images.length) return go();
+      // FR-421 (plan 3.7): files are checked on this computer, then staged for the call.
+      for (const n of images) {
+        n.src = hostPath(n.src!);
+        if (!isFile(n.src)) return fail(`The image ${n.src} does not exist. Nothing was changed.`);
+      }
+      await staging.begin();
+      return staging.withCall(async (c) => {
+        for (const n of images) n.staged = c.stage(n.src!);
+        return go();
+      });
+    }),
   );
 
   server.registerTool(
@@ -465,6 +550,127 @@ export function createServer(upstream: Upstream): McpServer {
       inputSchema: { steps: z.number().int().min(1).max(100).default(1), redo: z.boolean().default(false) },
     },
     guarded(async (args) => read(`ttam.undo(${JSON.stringify(args)})`, false)),
+  );
+
+  server.registerTool(
+    'manage_document',
+    {
+      title: 'Manage documents',
+      description: `Create, open, save or close documents; the result gives the current document afterwards (title, path, dirty, spreads, width and height in pixels, dpi, units) and the number of open documents. create: width and height in units (default Pixel), dpi (72), pages (1), transparent; the new document becomes current. open: path of a file Affinity opens (.af, .afdesign, PNG, SVG and others); Affinity edits a copy that save writes back to path, and the copy becomes current; a file that is open in Affinity but not current cannot be reached, because scripts cannot switch documents. save: saves the current document (to its original path for an opened file); a new or imported document needs saveAs. saveAs: path ending in .af; an existing file is replaced only with overwrite: true. close: closes the current document; with unsaved changes only when discardChanges is true. ${FILE_RULES}`,
+      inputSchema: {
+        action: z.enum(['create', 'open', 'save', 'saveAs', 'close']),
+        width: z.number().positive().max(100000).optional(),
+        height: z.number().positive().max(100000).optional(),
+        units: z.enum(['Pixel', 'Point', 'Millimetre', 'Centimetre', 'Inch', 'Pica']).optional(),
+        dpi: z.number().int().min(1).max(10000).optional(),
+        pages: z.number().int().min(1).max(500).optional(),
+        transparent: z.boolean().optional(),
+        path: z.string().min(1).optional(),
+        overwrite: z.boolean().optional(),
+        discardChanges: z.boolean().optional(),
+      },
+    },
+    guarded(async (a) => {
+      const extra = Object.keys(a).filter((k) => k !== 'action' && (a as Record<string, unknown>)[k] !== undefined && !ACTION_FIELDS[a.action].includes(k));
+      if (extra.length) return fail(`${extra.join(', ')} ${extra.length > 1 ? 'do' : 'does'} not apply to action ${a.action}.`);
+      if (a.action === 'create' && (a.width === undefined || a.height === undefined)) return fail('create needs width and height.');
+      if ((a.action === 'open' || a.action === 'saveAs') && !a.path) return fail(`${a.action} needs path.`);
+      const info = () => run('ttam.documentInfo()', false) as Promise<{ document: { path: string | null } | null; open: string[]; count: number }>;
+      let note: string | undefined;
+      if (a.action === 'create') {
+        await run(`ttam.createDocument(${JSON.stringify({ width: a.width, height: a.height, units: a.units ?? 'Pixel', dpi: a.dpi ?? 72, pages: a.pages ?? 1, transparent: !!a.transparent })})`, false);
+      } else if (a.action === 'open') {
+        const file = hostPath(a.path!);
+        if (!isFile(file)) return fail(`${file} does not exist.`);
+        await staging.begin();
+        const now = await info();
+        if (now.document && staging.mapPath(now.document.path) === file) note = 'The file is already open as the current document; nothing was opened.';
+        else if (now.open.some((p) => staging.mapPath(p) === file)) return fail(`${file} is open in Affinity but is not the current document, and scripts cannot switch documents. Ask the user to bring it to the front in Affinity.`);
+        else {
+          const copy = staging.newCopy(file, file);
+          try {
+            await run(`ttam.openDocument(${JSON.stringify(copy.affinity)})`, false);
+          } catch (e) {
+            rmSync(copy.folder, { recursive: true, force: true });
+            staging.tidy();
+            return fail(`Affinity could not open ${file}: ${errorText(e)}`);
+          }
+        }
+      } else if (a.action === 'save') {
+        await staging.begin();
+        const { path } = await run('ttam.saveDocument({})', false);
+        try {
+          staging.writeBack(path); // FR-408
+        } catch (e) {
+          return fail(`Affinity saved the document in its copy, but writing it to ${staging.mapPath(path)} failed: ${(e as Error).message}. Try save again, or saveAs another path.`);
+        }
+      } else if (a.action === 'saveAs') {
+        const file = hostPath(a.path!);
+        if (!file.toLowerCase().endsWith('.af')) return fail('saveAs needs a path ending in .af.');
+        checkTarget(file, a.overwrite);
+        await staging.begin();
+        const copy = staging.newCopy(file);
+        try {
+          await run(`ttam.saveDocument(${JSON.stringify({ as: copy.affinity })})`, false);
+        } catch (e) {
+          rmSync(copy.folder, { recursive: true, force: true });
+          throw e;
+        }
+        cpSync(copy.host, file, { preserveTimestamps: true });
+      } else {
+        await run(`ttam.closeDocument(${!!a.discardChanges})`, false); // R-46: a script of its own
+      }
+      const end = await info();
+      if (end.document?.path || end.open.some(Boolean)) await staging.tryLocate();
+      const warnings = staging.sync(end.open); // FR-411
+      if (end.document) end.document.path = staging.mapPath(end.document.path);
+      return ok({ document: end.document, open: end.count, ...(note ? { note } : {}), ...(warnings.length ? { warnings } : {}) });
+    }),
+  );
+
+  server.registerTool(
+    'export',
+    {
+      title: 'Export',
+      description: `Write the current document to a file. The extension of path picks the format: ${Object.entries(FORMATS)
+        .map(([e, f]) => `.${e} (${f.preset})`)
+        .join(', ')}; preset names any of Affinity's 64 export presets instead. target: spread (default; spreadIndex, default the current spread, cut to the page), nodes (ids on one spread: only those nodes, hidden ones included, cut to their visible box, transparent where the format allows), selection, or document (PDF: one file; otherwise one file per spread, name_1.ext, name_2.ext, ...). Raster size: 1 pixel per document pixel, or scale (up to 32), or width or height in pixels (the other side keeps the aspect); at most 32,768 px a side; SVG, PDF and EPS take no size. An existing file is replaced only with overwrite: true. History, selection and the saved state are unchanged. ${FILE_RULES}`,
+      inputSchema: {
+        path: z.string().min(1),
+        preset: z.string().min(1).optional(),
+        target: z.enum(['spread', 'nodes', 'selection', 'document']).default('spread'),
+        spreadIndex: z.number().int().min(0).optional(),
+        ids: z.array(z.string().min(1)).min(1).max(500).optional(),
+        scale: z.number().positive().max(32).optional(),
+        width: z.number().int().min(1).max(32768).optional(),
+        height: z.number().int().min(1).max(32768).optional(),
+        overwrite: z.boolean().default(false),
+      },
+    },
+    guarded(async (a) => {
+      const file = hostPath(a.path);
+      const ext = extname(file).slice(1).toLowerCase();
+      const format = FORMATS[ext];
+      if (!a.preset && !format) return fail(`The extension of ${basename(file)} names no format. Use one of ${Object.keys(FORMATS).map((e) => '.' + e).join(', ')}, or give preset.`);
+      const sizes = [a.scale, a.width, a.height].filter((v) => v !== undefined).length;
+      if (sizes > 1) return fail('Give at most one of scale, width and height.');
+      if (sizes && !a.preset && !format.raster) return fail(`.${ext} files have no pixel size: leave out scale, width and height.`);
+      if ((a.target === 'nodes') !== (a.ids !== undefined)) return fail('ids belongs to target nodes, and target nodes needs ids.');
+      if (a.spreadIndex !== undefined && a.target !== 'spread') return fail('spreadIndex applies only to target spread.');
+      const preset = a.preset ?? format.preset;
+      const raster = format && !a.preset ? format.raster : !VECTOR.test(preset);
+      checkFolder(dirname(file)); // before anything is exported
+      await staging.begin();
+      return staging.withCall(async (c) => {
+        const o = { target: a.target, spreadIndex: a.spreadIndex, ids: a.ids, preset, size: { scale: a.scale, width: a.width, height: a.height }, dir: c.dir, name: basename(file) };
+        const r = await run(`ttam.exportFiles(${JSON.stringify(o)})`);
+        const stem = basename(file, extname(file));
+        const out = (r.files as { sub: string; n?: number; width: number; height: number }[]).map((f) => ({ f, src: onlyFile(join(c.host, f.sub)), dest: f.n ? join(dirname(file), `${stem}_${f.n}${extname(file)}`) : file }));
+        for (const x of out) checkTarget(x.dest, a.overwrite); // FR-405: before the first file reaches the folder
+        for (const x of out) cpSync(x.src, x.dest);
+        return ok({ files: out.map((x) => ({ path: x.dest, bytes: statSync(x.dest).size, ...(raster ? { width: x.f.width, height: x.f.height } : {}) })), preset });
+      });
+    }),
   );
 
   return server;

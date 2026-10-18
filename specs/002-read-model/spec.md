@@ -152,3 +152,4 @@ Measured 2026-10-14: `npm test` 57 of 57 pass (38 of slice 001, 19 of slice 002)
 4. 2026-10-14, analysis: FR-216 gives `kind` only where the type table has one, as FR-209 does; FR-218 leaves out `fill` for nodes without a brush fill, such as layers.
 5. 2026-10-14, slice 003: FR-218 gives `fill: null` for an unfilled shape or path, which Affinity reports without a brush fill (R-44); other node types have no `fill`.
 6. 2026-10-14, slice 003: FR-325 replaces the dash rule of FR-219 (dashes only for lines of type `Dash`, R-37), and FR-326 extends FR-220 (text sizes include the node's scale, R-38).
+7. 2026-10-18, slice 004: FR-206 reports the document path as a host path (FR-423), and FR-216 adds `image: {width, height}` for image nodes (FR-422).

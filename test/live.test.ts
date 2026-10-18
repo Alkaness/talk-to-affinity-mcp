@@ -1,6 +1,10 @@
 // Live tests of slices 001 and 002 against a running Affinity (AFFINITY_LIVE=1). They create and close their own documents.
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
+import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { crc32, deflateSync, inflateSync } from 'node:zlib';
 import { createInterface } from 'node:readline';
 import { test, type TestContext } from 'node:test';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
@@ -800,4 +804,327 @@ live('NFR-301 NFR-302 200 nodes are created within 3 s; the result for 100 nodes
   assert.ok(ms < 3000, `${Math.round(ms)} ms`);
   const hundred = textOf(await t.call('create_nodes', { nodes: many(100) }));
   assert.ok(hundred.length < 8000, `${hundred.length} characters`);
+});
+
+// Slice 004: files and export. Targets lie in temporary host folders outside Affinity's Desktop.
+
+const temp = () => mkdtempSync(join(tmpdir(), 'ttam-live-'));
+
+/** A PNG of w x h px in one colour. */
+function png(w: number, h: number, [r, g, b, a]: number[]) {
+  const row = Buffer.alloc(w * 4 + 1);
+  for (let x = 0; x < w; x++) row.set([r, g, b, a], 1 + x * 4);
+  const chunk = (type: string, data: Buffer) => {
+    const body = Buffer.concat([Buffer.from(type), data]);
+    const out = Buffer.alloc(body.length + 8);
+    out.writeUInt32BE(data.length, 0);
+    body.copy(out, 4);
+    out.writeUInt32BE(crc32(body), body.length + 4);
+    return out;
+  };
+  const ihdr = Buffer.alloc(13);
+  ihdr.writeUInt32BE(w, 0);
+  ihdr.writeUInt32BE(h, 4);
+  ihdr.set([8, 6, 0, 0, 0], 8);
+  return Buffer.concat([Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]), chunk('IHDR', ihdr), chunk('IDAT', deflateSync(Buffer.concat(Array.from({ length: h }, () => row)))), chunk('IEND', Buffer.alloc(0))]);
+}
+
+/** Size, colour type and the alpha of the top-left pixel of a PNG (that pixel is stored unfiltered in effect: its neighbours count as 0). */
+function pngInfo(file: string) {
+  const b = readFileSync(file);
+  const idat: Buffer[] = [];
+  for (let at = 8; at < b.length; ) {
+    const len = b.readUInt32BE(at);
+    if (b.toString('latin1', at + 4, at + 8) === 'IDAT') idat.push(b.subarray(at + 8, at + 8 + len));
+    at += len + 12;
+  }
+  const colourType = b[25];
+  const raw = inflateSync(Buffer.concat(idat));
+  return { width: b.readUInt32BE(16), height: b.readUInt32BE(20), colourType, alpha: colourType === 6 ? raw[4] : 255 };
+}
+
+function jpegSize(data: Buffer) {
+  for (let at = 2; at < data.length; ) {
+    const marker = data[at + 1];
+    if (marker >= 0xc0 && marker <= 0xc2) return { width: data.readUInt16BE(at + 7), height: data.readUInt16BE(at + 5) };
+    at += 2 + data.readUInt16BE(at + 2);
+  }
+  throw new Error('no SOF marker');
+}
+
+type T = Awaited<ReturnType<typeof setup>>;
+const STATE = `const d = require('/application.js').app.documents.current; return { id: d.sessionUuid, position: d.history.position, size: d.history.size, dirty: d.isDirty, selection: d.selection.length };`;
+const state = async (t: T) => jsonOf(await t.call('run_script', { code: STATE, mutates: false })).result as { id: string; position: number; size: number; dirty: boolean; selection: number };
+const manage = async (t: T, args: Record<string, unknown>) => {
+  const r = await t.call('manage_document', args);
+  assert.equal(r.isError, undefined, textOf(r));
+  const out = jsonOf(r);
+  if (args.action === 'create' || args.action === 'open') t.documents.push((await state(t)).id); // closed by the cleanup if a test fails
+  return out;
+};
+const make = (t: T, more: Record<string, unknown> = {}) => manage(t, { action: 'create', width: 400, height: 300, ...more });
+const done = (t: T) => manage(t, { action: 'close', discardChanges: true });
+const exported = async (t: T, args: Record<string, unknown>) => {
+  const r = await t.call('export', args);
+  assert.equal(r.isError, undefined, textOf(r));
+  return jsonOf(r) as { files: { path: string; bytes: number; width?: number; height?: number }[]; preset: string };
+};
+
+live('FR-403 FR-424 get_status finds the Desktop on this computer and reports file access', async (ctx) => {
+  const t = await setup(ctx);
+  const f = jsonOf(await t.call('get_status')).files;
+  assert.equal(f.access, true, 'turn on Access files on your Desktop for the live suite');
+  assert.match(f.desktop, /Desktop$/);
+  assert.ok(existsSync(f.hostDesktop), f.hostDesktop);
+  assert.ok(!existsSync(join(f.hostDesktop, 'talk-to-affinity')), 'no probe or staging folder remains');
+});
+
+live('FR-406 FR-412 create sets units, DPI, pages and transparency', async (ctx) => {
+  const t = await setup(ctx);
+  const r = await make(t, { width: 210, height: 297, units: 'Millimetre', dpi: 300, pages: 2, transparent: true });
+  const d = r.document;
+  assert.deepEqual([d.path, d.spreads, d.width, d.height, d.dpi, d.units], [null, 2, 2480.31, 3507.87, 300, 'Millimetre']);
+  assert.ok(r.open >= 1);
+  const out = temp();
+  const [f] = (await exported(t, { path: join(out, 'page.png'), width: 100 })).files;
+  assert.deepEqual([f.width, f.height], [100, 141]);
+  const p = pngInfo(f.path);
+  assert.deepEqual([p.width, p.height, p.colourType, p.alpha], [100, 141, 6, 0]);
+  const plain = await make(t);
+  assert.deepEqual([plain.document.width, plain.document.height, plain.document.dpi, plain.document.units, plain.document.spreads], [400, 300, 72, 'Pixel', 1]);
+  await done(t);
+  await done(t);
+});
+
+live('FR-407 FR-409 FR-410 FR-423 saveAs, close and open keep content and IDs, at host paths', async (ctx) => {
+  const t = await setup(ctx);
+  const out = temp();
+  const file = join(out, 'poster.af');
+  await make(t);
+  await t.call('create_nodes', { nodes: [{ type: 'rect', id: 'card', box: [20, 20, 100, 60], fill: '#cc2222' }] });
+  const saved = await manage(t, { action: 'saveAs', path: file });
+  assert.deepEqual([saved.document.title, saved.document.path, saved.document.dirty], ['poster', file, false]);
+  assert.ok(statSync(file).size > 0);
+  const s = jsonOf(await t.call('get_status'));
+  assert.ok(s.documents.some((d: { path: string }) => d.path === file), JSON.stringify(s.documents));
+  assert.equal(jsonOf(await t.call('get_document', {})).document.path, file);
+  const closed = await manage(t, { action: 'close' });
+  assert.notEqual(closed.document?.path, file);
+  const opened = await manage(t, { action: 'open', path: file });
+  assert.deepEqual([opened.document.title, opened.document.path, opened.document.dirty], ['poster', file, false]);
+  const [card] = await nodes(t, ['card']);
+  assert.deepEqual([card.box, card.fill], [[20, 20, 100, 60], '#cc2222ff']);
+  await done(t);
+});
+
+live('FR-408 FR-411 save writes back to the original path; a copy closed in Affinity is written back by the next call', async (ctx) => {
+  const t = await setup(ctx);
+  const out = temp();
+  const file = join(out, 'work.af');
+  await make(t);
+  await t.call('create_nodes', { nodes: [{ type: 'rect', id: 'r', box: [0, 0, 50, 50], fill: '#111111' }] });
+  await manage(t, { action: 'saveAs', path: file });
+  await done(t);
+  await manage(t, { action: 'open', path: file });
+  await t.call('update_nodes', { updates: [{ id: 'r', set: { fill: '#22aa22' } }] });
+  const before = readFileSync(file);
+  await manage(t, { action: 'save' });
+  assert.notDeepEqual(readFileSync(file), before);
+  // The user saves and closes in Affinity, here by script; the next manage_document call writes the copy back.
+  await t.call('update_nodes', { updates: [{ id: 'r', set: { fill: '#3333cc' } }] });
+  await t.call('run_script', { code: "require('/application.js').app.documents.current.save();" });
+  const mid = readFileSync(file);
+  await t.call('run_script', { code: "require('/application.js').app.documents.current.close();" });
+  assert.deepEqual(readFileSync(file), mid, 'not written back yet');
+  await make(t);
+  assert.notDeepEqual(readFileSync(file), mid);
+  await done(t);
+  await manage(t, { action: 'open', path: file });
+  assert.equal((await nodes(t, ['r']))[0].fill, '#3333ccff');
+  await done(t);
+});
+
+live('FR-410 close refuses unsaved changes unless discardChanges is true', async (ctx) => {
+  const t = await setup(ctx);
+  await make(t);
+  await t.call('create_nodes', { nodes: [{ type: 'rect', box: [0, 0, 5, 5] }] });
+  const id = (await state(t)).id;
+  const r = await t.call('manage_document', { action: 'close' });
+  assert.equal(r.isError, true);
+  assert.match(textOf(r), /unsaved changes.*discardChanges: true/);
+  assert.equal((await state(t)).id, id);
+  await done(t);
+});
+
+live('FR-407 FR-408 an open file is a no-op when current and refused otherwise; imports need saveAs; bad files are named', async (ctx) => {
+  const t = await setup(ctx);
+  const out = temp();
+  const file = join(out, 'a.af');
+  await make(t);
+  await manage(t, { action: 'saveAs', path: file });
+  const again = await manage(t, { action: 'open', path: file });
+  assert.match(again.note, /already open as the current document/);
+  await make(t);
+  const other = await t.call('manage_document', { action: 'open', path: file });
+  assert.match(textOf(other), /not the current document, and scripts cannot switch documents/);
+  await done(t);
+  await done(t);
+  writeFileSync(join(out, 'pic.png'), png(30, 20, [255, 0, 0, 255]));
+  const imported = await manage(t, { action: 'open', path: join(out, 'pic.png') });
+  assert.equal(imported.document.title, 'pic.png');
+  const save = await t.call('manage_document', { action: 'save' });
+  assert.match(textOf(save), /saveAs/);
+  await done(t);
+  writeFileSync(join(out, 'bad.af'), 'not a document');
+  const bad = await t.call('manage_document', { action: 'open', path: join(out, 'bad.af') });
+  assert.match(textOf(bad), /could not open .*bad\.af/);
+});
+
+live('FR-405 saveAs refuses an existing file without overwrite and replaces it with overwrite', async (ctx) => {
+  const t = await setup(ctx);
+  const out = temp();
+  const file = join(out, 'x.af');
+  writeFileSync(file, 'old');
+  await make(t);
+  assert.match(textOf(await t.call('manage_document', { action: 'saveAs', path: file })), /overwrite: true/);
+  assert.equal(readFileSync(file, 'utf8'), 'old');
+  await manage(t, { action: 'saveAs', path: file, overwrite: true });
+  assert.notEqual(readFileSync(file, 'utf8'), 'old');
+  await done(t);
+});
+
+live('FR-414 FR-416 FR-418 a spread exports at its exact size, by scale or width, also another spread', async (ctx) => {
+  const t = await setup(ctx);
+  const out = temp();
+  await make(t, { pages: 2 });
+  await t.call('create_nodes', { nodes: [{ type: 'rect', box: [-50, -50, 600, 100], fill: '#336699' }] });
+  const a = await exported(t, { path: join(out, 'a.png'), scale: 2 });
+  assert.equal(a.preset, 'PNG');
+  assert.deepEqual([a.files[0].width, a.files[0].height, a.files[0].bytes], [800, 600, statSync(a.files[0].path).size]);
+  assert.deepEqual([pngInfo(a.files[0].path).width, pngInfo(a.files[0].path).height], [800, 600], 'cut to the page');
+  const b = await exported(t, { path: join(out, 'b.jpg'), spreadIndex: 1, width: 200 });
+  assert.deepEqual(jpegSize(readFileSync(b.files[0].path)), { width: 200, height: 150 });
+  const c = await exported(t, { path: join(out, 'c.svg') });
+  assert.match(readFileSync(c.files[0].path, 'utf8'), /<svg/);
+  assert.equal(c.files[0].width, undefined);
+  await done(t);
+});
+
+live('FR-415 FR-417 nodes and the selection export alone, cropped, over transparency, leaving the document unchanged', async (ctx) => {
+  const t = await setup(ctx);
+  const out = temp();
+  await make(t);
+  await t.call('create_nodes', {
+    nodes: [
+      { type: 'rect', id: 'bg', box: [0, 0, 400, 300], fill: '#ffffff' },
+      { type: 'ellipse', id: 'dot', box: [40.5, 40.5, 100, 50], fill: '#ff0000' },
+      { type: 'layer', id: 'ghosts', children: [{ type: 'rect', id: 'ghost', box: [200, 200, 20, 10], fill: '#00ff00' }] },
+    ],
+  });
+  await t.call('update_nodes', { updates: [{ id: 'ghost', set: { hidden: true } }] });
+  await manage(t, { action: 'saveAs', path: join(out, 'n.af') });
+  const before = await state(t);
+  const dot = await exported(t, { path: join(out, 'dot.png'), target: 'nodes', ids: ['dot'] });
+  const p = pngInfo(dot.files[0].path);
+  assert.deepEqual([p.width, p.height, dot.files[0].width, dot.files[0].height], [101, 51, 101, 51]);
+  assert.equal(p.alpha, 0, 'the corner outside the ellipse is transparent');
+  const ghost = await exported(t, { path: join(out, 'ghost.png'), target: 'nodes', ids: ['ghost'] });
+  assert.deepEqual([ghost.files[0].width, ghost.files[0].height], [20, 10]);
+  assert.deepEqual(await state(t), before);
+  const sel = await exported(t, { path: join(out, 'sel.png'), target: 'selection' });
+  assert.ok(sel.files[0].width! > 0);
+  assert.deepEqual(await state(t), before);
+  await done(t);
+  await make(t);
+  assert.match(textOf(await t.call('export', { path: join(out, 'none.png'), target: 'selection' })), /Nothing is selected/);
+  await done(t);
+});
+
+live('FR-413 FR-414 FR-405 a document exports one PDF or one PNG per spread; overwrite and presets', async (ctx) => {
+  const t = await setup(ctx);
+  const out = temp();
+  await make(t, { pages: 2 });
+  const pngs = await exported(t, { path: join(out, 'deck.png'), target: 'document' });
+  assert.deepEqual(pngs.files.map((f) => f.path), [join(out, 'deck_1.png'), join(out, 'deck_2.png')]);
+  const pdf = await exported(t, { path: join(out, 'deck.pdf'), target: 'document' });
+  assert.equal(pdf.files.length, 1);
+  assert.equal(readFileSync(pdf.files[0].path, 'latin1').slice(0, 4), '%PDF');
+  const again = await t.call('export', { path: join(out, 'deck.pdf'), target: 'document' });
+  assert.match(textOf(again), /exists\. Set overwrite: true/);
+  await exported(t, { path: join(out, 'deck.pdf'), target: 'document', overwrite: true });
+  const r = await t.call('export', { path: join(out, 'x.png'), preset: 'PNG best' });
+  assert.match(textOf(r), /closest presets are "PNG/);
+  const custom = await exported(t, { path: join(out, 'best.jpg'), preset: 'JPEG (Best quality)', height: 60 });
+  assert.deepEqual(jpegSize(readFileSync(custom.files[0].path)), { width: 80, height: 60 });
+  await done(t);
+});
+
+live('FR-419 FR-420 NFR-402 render shows chosen nodes at up to 2,048 px without changing the document', async (ctx) => {
+  const t = await setup(ctx);
+  await make(t);
+  await t.call('create_nodes', { nodes: [{ type: 'rect', id: 'icon', box: [10, 10, 40, 20], fill: '#123456' }, { type: 'ellipse', box: [100, 100, 50, 50] }] });
+  const before = await state(t);
+  const t0 = performance.now();
+  const r = await t.call('render', { target: 'nodes', ids: ['icon'], maxSize: 2048 });
+  const ms = performance.now() - t0;
+  assert.ok(ms < 3000, `${Math.round(ms)} ms`);
+  const img = r.content[0] as { type: string; mimeType: string; data: string };
+  assert.deepEqual([img.type, img.mimeType], ['image', 'image/jpeg']);
+  assert.deepEqual(jpegSize(Buffer.from(img.data, 'base64')), { width: 2048, height: 1024 });
+  const spread = (await t.call('render', { maxSize: 2048 })).content[0] as { data: string };
+  assert.deepEqual(jpegSize(Buffer.from(spread.data, 'base64')), { width: 2048, height: 1536 });
+  const small = (await t.call('render', { target: 'nodes', ids: ['icon'] })).content[0] as { data: string };
+  assert.deepEqual(jpegSize(Buffer.from(small.data, 'base64')), { width: 1024, height: 512 });
+  assert.deepEqual(await state(t), before);
+  const native = (await t.call('render', {})).content[0] as { data: string };
+  assert.ok(Math.max(...Object.values(jpegSize(Buffer.from(native.data, 'base64')))) <= 1024);
+  await done(t);
+});
+
+live('FR-421 FR-422 images are placed with contain or stretch in 1 undo step, embedded, and bad files are refused', async (ctx) => {
+  const t = await setup(ctx);
+  const out = temp();
+  const src = join(out, 'photo.png');
+  writeFileSync(src, png(300, 200, [0, 128, 255, 255]));
+  await make(t);
+  const jpg = (await exported(t, { path: join(out, 'shot.jpg'), width: 120 })).files[0].path;
+  const before = await state(t);
+  const r = await t.call('create_nodes', {
+    nodes: [
+      { type: 'image', id: 'contain', src, box: [0, 0, 200, 200] },
+      { type: 'image', id: 'stretch', src: jpg, box: [210, 10, 100, 100], fit: 'stretch' },
+      { type: 'image', id: 'turned', name: 'Photo', src, box: [50, 150, 90, 60], rotation: 30, opacity: 0.5 },
+    ],
+  });
+  assert.equal(r.isError, undefined, textOf(r));
+  assert.equal(jsonOf(r).undoSteps, 1);
+  assert.equal((await state(t)).position, before.position + 1);
+  const [c, s, turned] = await nodes(t, ['contain', 'stretch', 'turned']);
+  assert.deepEqual([c.type, c.box, c.image], ['image', [0, 33.33, 200, 133.33], { width: 300, height: 200 }]);
+  assert.deepEqual([s.box, s.image], [[210, 10, 100, 100], { width: 120, height: 90 }]);
+  assert.deepEqual([turned.name, turned.rotation, turned.opacity], ['Photo', 30, 0.5]);
+  rmSync(src);
+  const shown = await t.call('render', { target: 'nodes', ids: ['contain'], maxSize: 256 });
+  assert.equal(shown.content[0].type, 'image', 'embedded: renders after the source file is gone');
+  writeFileSync(join(out, 'bad.png'), 'not an image');
+  const mid = await state(t);
+  const bad = await t.call('create_nodes', { nodes: [{ type: 'rect', box: [0, 0, 5, 5] }, { type: 'image', src: join(out, 'bad.png'), box: [0, 0, 10, 10] }] });
+  assert.match(textOf(bad), /bad\.png is not a PNG, JPEG, WebP, TIFF or GIF file.*Nothing was changed/);
+  assert.equal((await state(t)).position, mid.position);
+  await done(t);
+});
+
+live('NFR-401 FR-404 a 200-node spread exports at 2,048 px within 2 s and no staged file remains', async (ctx) => {
+  const t = await setup(ctx);
+  const out = temp();
+  await make(t, { width: 1000, height: 1000 });
+  await t.call('create_nodes', { nodes: Array.from({ length: 200 }, (_, i) => ({ type: 'ellipse', box: [(i % 20) * 50, Math.floor(i / 20) * 50, 40, 40], fill: '#aa3366' })) });
+  const t0 = performance.now();
+  const r = await exported(t, { path: join(out, 'big.png'), width: 2048 });
+  const ms = performance.now() - t0;
+  assert.ok(ms < 2000, `${Math.round(ms)} ms`);
+  assert.deepEqual([r.files[0].width, r.files[0].height], [2048, 2048]);
+  await done(t);
+  const host = jsonOf(await t.call('get_status')).files.hostDesktop;
+  assert.ok(!existsSync(join(host, 'talk-to-affinity')), 'staging folder removed');
 });

@@ -150,6 +150,7 @@ var ttam = (() => {
     if (FILLED.includes(e.type)) e.fill = node.hasBrushFill ? fill(node.brushFillDescriptor) : null;
     if (node.hasPenFill) e.stroke = stroke(node);
     if (isText) e.text = text(node, dpi);
+    if (e.type === 'image') e.image = { width: node.rasterWidth, height: node.rasterHeight }; // R-54
     const effects = node.layerEffectsInterface.effects;
     if (effects.length) e.effects = effects.map(effect);
     return e;
@@ -307,15 +308,19 @@ var ttam = (() => {
     return row[b.length];
   }
 
+  // The 5 names closest to q: names containing it (or contained in it) first, then by edit distance.
+  function closest(names, q) {
+    const k = lower(q);
+    const rank = (n) => (lower(n).includes(k) || k.includes(lower(n)) ? 0 : 1000) + distance(lower(n), k);
+    return names.slice().sort((a, b) => rank(a) - rank(b)).slice(0, 5);
+  }
+
   // FR-312: family and style by name in any case; without a style the face of weight 400 that is not italic.
   function matchFont(families, family, style) {
     const all = families.map((f) => ({ f, name: f.name, key: lower(f.name) }));
     const q = lower(family);
     const hit = all.find((x) => x.key === q);
-    if (!hit) {
-      const rank = (x) => (x.key.includes(q) || q.includes(x.key) ? 0 : 1000) + distance(x.key, q);
-      return { missing: 'family', suggestions: all.sort((a, b) => rank(a) - rank(b)).slice(0, 5).map((x) => x.name) };
-    }
+    if (!hit) return { missing: 'family', suggestions: closest(all.map((x) => x.name), family) };
     const faces = Array.from(hit.f.fonts);
     const face = style ? faces.find((x) => lower(x.traitsName) === lower(style)) : faces.find((x) => x.weight === 400 && !x.isItalic) || faces[0];
     if (!face) return { missing: 'style', family: hit.name, styles: faces.map((x) => x.traitsName) };
@@ -338,6 +343,25 @@ var ttam = (() => {
     const c = Math.cos(deg * RAD);
     const s = Math.sin(deg * RAD);
     return [c, -s, cx - c * cx + s * cy, s, c, cy - s * cx - c * cy];
+  }
+
+  const IDENTITY = [1, 0, 0, 0, 1, 0];
+  // a after b, both as (m00, m01, tx, m10, m11, ty).
+  function multiply(a, b) {
+    return [a[0] * b[0] + a[1] * b[3], a[0] * b[1] + a[1] * b[4], a[0] * b[2] + a[1] * b[5] + a[2], a[3] * b[0] + a[4] * b[3], a[3] * b[1] + a[4] * b[4], a[3] * b[2] + a[4] * b[5] + a[5]];
+  }
+
+  // FR-421, R-54: a bitmap of bw x bh px placed in box; contain keeps its aspect, centred.
+  function imageData(b, bw, bh, fit) {
+    let [x, y, w, h] = b;
+    if (fit !== 'stretch') {
+      const k = Math.min(w / bw, h / bh);
+      x += (w - bw * k) / 2;
+      y += (h - bh * k) / 2;
+      w = bw * k;
+      h = bh * k;
+    }
+    return [w / bw, 0, x, 0, h / bh, y];
   }
 
   // Scale about the box corner and move it: box `from` becomes box `to`; a side of length 0 keeps scale 1.
@@ -511,6 +535,7 @@ var ttam = (() => {
     const { N, G, F } = sdk();
     let def;
     let pivot;
+    let place;
     if (s.type === 'layer') {
       def = N.ContainerNodeDefinition.create(s.name || null);
     } else if (s.type === 'path') {
@@ -539,12 +564,16 @@ var ttam = (() => {
         def = N.ArtTextNodeDefinition.createFromStoryBuilder({ x: s.at[0], y: s.at[1] }, sb); // R-43: the first baseline starts at `at`
         pivot = s.at;
       }
+    } else if (s.type === 'image') {
+      def = N.ImageNodeDefinition.create(require('/rasterobject.js').RasterFormat.RGBA8).setBitmap(s.bitmap); // R-54
+      place = imageData(s.box, s.bitmap.width, s.bitmap.height, s.fit);
+      pivot = centre(s.box);
     } else {
       def = N.ShapeNodeDefinition.create(shapeOf(s), rectangle(s.box), fillDescriptor(s.fill, s.box), penFill(s.stroke), lineStyle(s.stroke));
       pivot = centre(s.box);
     }
     if (s.name !== undefined) def.userDescription = s.name;
-    if (s.rotation) def.transform = matrix(rotationData(pivot[0], pivot[1], s.rotation)); // R-33
+    if (s.rotation || place) def.transform = matrix(multiply(s.rotation ? rotationData(pivot[0], pivot[1], s.rotation) : IDENTITY, place || IDENTITY)); // R-33
     return def;
   }
 
@@ -636,6 +665,14 @@ var ttam = (() => {
     for (const s of all) if (s.id === undefined) s.id = nextId(s.type, used);
     const fonts = resolveFonts(all.filter((s) => s.type === 'text'), o.fontFallback);
     if (fonts.fail) return fonts;
+    for (const s of all) {
+      if (s.type !== 'image') continue;
+      try {
+        s.bitmap = require('/rasterobject.js').Bitmap.loadFromFile(s.staged); // R-54: NOT_SUPPORTED or ERROR
+      } catch (e) {
+        return { fail: 'The image ' + s.src + ' is not a PNG, JPEG, WebP, TIFF or GIF file Affinity can read.' + nothing };
+      }
+    }
     const waves = plan(o.nodes);
     return atomic(doc, () => {
       waves.forEach((wave, w) => {
@@ -867,7 +904,160 @@ var ttam = (() => {
     return { done, position: h.position, size: h.size, undo: h.canUndo ? item(h.position - 1) : null, redo: h.canRedo ? item(h.position) : null };
   }
 
-  return { getDocument, getNodes, listFonts, createNodes, updateNodes, deleteNodes, undo, plan, nextId, matchFont, gradientData, rotationData, boxData, paragraphRanges, atomic };
+  // ---- Files and export (specs/004-files-export/plan.md section 3) ----
+
+  const DIR = 'talk-to-affinity';
+  const app = () => require('/application.js').app;
+
+  // FR-402, FR-403 (plan 3.2): access, Affinity's Desktop, and the probe file in its staging folder.
+  function fileAccess(probe) {
+    const desktop = app().userDesktopPath;
+    const access = !!require('/environment.js').Environment.permissions.fileSystem;
+    if (access && probe) {
+      const { FileSystemApi, File } = require('/fs.js');
+      FileSystemApi.createDirectories(desktop + '/' + DIR); // R-51
+      const f = File.create(desktop + '/' + DIR + '/' + probe, 'w');
+      f.writeString('ttam-probe');
+      f.close();
+    }
+    return { access, desktop };
+  }
+
+  // FR-412 (plan 3.5): the current document and the paths of all open ones (R-13 item 6).
+  function documentInfo() {
+    const d = current();
+    const all = app().documents.all;
+    return {
+      document: d && { title: d.title, path: d.path || null, dirty: d.isDirty, spreads: d.spreads.toArray().length, width: r2(d.widthPixels), height: r2(d.heightPixels), dpi: d.dpi, units: String(d.units) },
+      open: all.map((x) => x.path || ''),
+      count: all.length,
+    };
+  }
+
+  // FR-406, R-53: units first, then the size in those units.
+  function createDocument(o) {
+    const { Document, NewDocumentOptions } = require('/document.js');
+    const opt = NewDocumentOptions.createDefault();
+    opt.units = require('/units.js').UnitType[o.units];
+    opt.width = o.width;
+    opt.height = o.height;
+    opt.dpi = o.dpi;
+    if (o.pages > 1) {
+      opt.isMultiPage = true;
+      opt.isFacing = false;
+      opt.pageCount = o.pages;
+    }
+    if (o.transparent) opt.isTransparentBackground = true;
+    Document.create(opt);
+    return { created: true };
+  }
+
+  // FR-407, R-52: the loaded document becomes current.
+  function openDocument(path) {
+    require('/document.js').Document.load(path);
+    return { opened: true };
+  }
+
+  // FR-408, FR-409, R-52.
+  function saveDocument(o) {
+    const d = current();
+    if (!d) return null;
+    if (o.as) d.saveAs(o.as);
+    else if (d.mustSaveAs) return { fail: 'This document has never been saved as an Affinity file (new, or imported from another format). Use action saveAs with a path ending in .af.' };
+    else d.save();
+    return { path: d.path };
+  }
+
+  // FR-410, R-46: this script changes nothing but the close.
+  function closeDocument(discard) {
+    const d = current();
+    if (!d) return null;
+    if (d.isDirty && !discard) return { fail: 'The document "' + d.title + '" has unsaved changes. Save it first, or set discardChanges: true to close it anyway.' };
+    d.close();
+    return { closed: true };
+  }
+
+  // FR-416 (plan 3.6 item 3): the pixel size for an area of w x h document pixels.
+  function exportSize(w, h, o) {
+    let k = 1;
+    if (o.scale !== undefined) k = o.scale;
+    else if (o.width !== undefined) k = o.width / w;
+    else if (o.height !== undefined) k = o.height / h;
+    else if (o.longest !== undefined) k = o.longest / Math.max(w, h);
+    const size = { width: o.width !== undefined ? o.width : Math.max(1, Math.round(w * k)), height: o.height !== undefined ? o.height : Math.max(1, Math.round(h * k)) };
+    if (size.width > 32768 || size.height > 32768) return { fail: 'The export would be ' + size.width + ' x ' + size.height + ' px; a side can be at most 32,768 px. Nothing was written.' };
+    return size;
+  }
+
+  // Union of visible boxes widened to whole pixels (R-48 item 4); the base box for nodes without a visible extent (R-21).
+  function area(nodes) {
+    let x0 = Infinity;
+    let y0 = Infinity;
+    let x1 = -Infinity;
+    let y1 = -Infinity;
+    for (const n of nodes) {
+      const v = n.spreadVisibleBox;
+      const b = v.x <= -1e300 ? n.spreadBaseBox : v;
+      if (b.x <= -1e300) continue;
+      x0 = Math.min(x0, b.x);
+      y0 = Math.min(y0, b.y);
+      x1 = Math.max(x1, b.x + b.width);
+      y1 = Math.max(y1, b.y + b.height);
+    }
+    return x0 === Infinity ? null : [Math.ceil(x1) - Math.floor(x0), Math.ceil(y1) - Math.floor(y0)];
+  }
+
+  // export and render (plan 3.6): each export goes to <dir>/s<n>/<name>; the host renames and copies.
+  function exportFiles(o) {
+    const doc = current();
+    if (!doc) return null;
+    const { FileExportOptions, FileExportArea } = require('/document.js');
+    const names = FileExportOptions.allPresetNames;
+    if (names.indexOf(o.preset) < 0) return { fail: 'Unknown export preset "' + o.preset + '". The closest presets are ' + closest(names, o.preset).map((n) => '"' + n + '"').join(', ') + '.' };
+    const options = FileExportOptions.createWithPresetName(o.preset);
+    const spreads = doc.spreads.toArray();
+    const page = [doc.widthPixels, doc.heightPixels];
+    const jobs = [];
+    let nodes = null;
+    if (o.target === 'spread') {
+      const i = o.spreadIndex === undefined ? Math.max(0, spreads.findIndex((s) => s.isSameNode(doc.currentSpread))) : o.spreadIndex;
+      if (i >= spreads.length) return { fail: 'Spread ' + i + ' does not exist; the document has ' + spreads.length + ' spread(s), indexed from 0.' };
+      jobs.push({ area: FileExportArea.createForSpreads(String(i + 1)), wh: page }); // R-48 item 2: counted from 1
+    } else if (o.target === 'document') {
+      if (/^PDF/.test(o.preset)) jobs.push({ area: FileExportArea.createForWholeDocument(), wh: page });
+      else spreads.forEach((s, i) => jobs.push({ area: FileExportArea.createForSpreads(String(i + 1)), wh: page, n: i + 1 }));
+    } else {
+      if (o.target === 'nodes') {
+        const at = scan(doc, o.ids);
+        if (at.unknown.length) return { fail: 'No node has the ID ' + at.unknown.map((x) => '"' + x + '"').join(', ') + '.' };
+        const hits = o.ids.map((id) => at.found.get(id));
+        if (hits.some((h) => h.v.top)) return { fail: 'Spreads are exported with target spread, not as nodes.' };
+        if (new Set(hits.map((h) => h.v.spread)).size > 1) return { fail: 'The nodes lie on more than one spread; export each spread in its own call.' };
+        nodes = hits.map((h) => h.node);
+      } else {
+        nodes = doc.selection.nodes.toArray();
+        if (!nodes.length) return { fail: 'Nothing is selected in the current document.' };
+      }
+      const wh = area(nodes);
+      if (!wh) return { fail: 'The nodes have no visible extent to export.' };
+      jobs.push({ area: FileExportArea.createForSelection(null), wh }); // R-48 item 3: the current selection
+    }
+    const sized = jobs.map((j) => exportSize(j.wh[0], j.wh[1], o.size));
+    const bad = sized.find((s) => s.fail);
+    if (bad) return bad;
+    const before = o.target === 'nodes' ? doc.selection : null;
+    const preview = (sel) => doc.executeCommand(require('/commands.js').DocumentCommand.createSetSelection(sel), true); // R-49: no history step
+    if (before) preview(require('/selections.js').Selection.create(doc, nodes));
+    try {
+      jobs.forEach((j, k) => doc.export(o.dir + '/s' + k + '/' + o.name, options, j.area, sized[k])); // R-47: vector presets ignore the size
+    } catch (e) {
+      if (before) preview(before);
+      throw e;
+    }
+    return { files: jobs.map((j, k) => Object.assign({ sub: 's' + k }, j.n ? { n: j.n } : {}, sized[k])) };
+  }
+
+  return { getDocument, getNodes, listFonts, createNodes, updateNodes, deleteNodes, undo, plan, nextId, matchFont, gradientData, rotationData, boxData, paragraphRanges, atomic, fileAccess, documentInfo, createDocument, openDocument, saveDocument, closeDocument, exportSize, exportFiles, imageData, multiply };
 })();
 
 var __ttamBody = function () {

@@ -323,10 +323,92 @@ Rendered with `render_spread` and inspected.
 ### R-44 Unfilled shapes
 
 1. A shape created with `FillDescriptor.createNone()` as its brush reports `hasBrushFill` false; `hasPenFill` stays true without a stroke (weight 0).
-2. A probe that read `brushFillDescriptor` of such a node lost its connection, and Affinity had to be restarted; the same probe without that read ran normally. The library reads a descriptor only when the matching `has...Fill` holds.
+2. A probe that read `brushFillDescriptor` of such a node lost its connection, and Affinity had to be restarted; the same probe without that read ran normally. The library reads a descriptor only when the matching `has...Fill` holds. Corrected by R-46: the read itself is harmless; the probe had closed its document in the same script.
 3. Consequence: whether a fill applies is decided by the node type, not by `hasBrushFill`.
 
 ### R-45 History items
 
 1. `history.getItem(i).description` is the description of step `i`, counted from 0: at position `p` the next undo is item `p - 1` and the next redo is item `p`. After an undo, a description can lose its detail ("Delete b" became "Delete").
 2. `undoDescription` and `redoDescription` throw `INVALID_OP` at position 0, even while `canRedo` holds.
+
+## 8. Slice 004 facts (2026-10-14, same build)
+
+Measured with probe scripts run through the server's own `Upstream`. Each probe created its own documents and closed them in a separate script (R-46). Test images were made with ImageMagick: 300 x 200 px in PNG, JPEG, WebP, TIFF, GIF, a PNG with transparency, an SVG, and a text file named `bad.png`.
+
+### R-46 Closing a document in the script that changed its selection
+
+1. A script that changed the selection of a document (with `createSetSelection`, or by inserting nodes with `andSelect` true) and then closed that document crashed Affinity with exit code -1073741819 (access violation). The stack ends in `LayerView.OnNewSelectionNotification` and `LayersDataSourceItem.EnsureVisible`: the layers panel handles the selection notification after the script has returned, when the document is gone. The crash depends on timing; several earlier probes that inserted nodes and closed their document in one script ran normally.
+2. Retested in separate scripts (create, read, close): reading `brushFillDescriptor` of an unfilled shape returns a `FillDescriptor` whose fill is a `NoFill`, without a crash. The crash recorded in R-44 came from the close in the same script.
+3. Consequence: the server closes a document in a script that changes nothing else, and probes and live tests close their documents in a separate call.
+
+### R-47 Export size
+
+1. The fourth argument of `doc.export(path, options, area, size)` takes a `Size` from `/geometry.js`, a plain `{width, height}` object, `null` or `undefined`. A number throws "expected Size or null"; `ExportScale` and `ExportSize` objects, with or without `.handle`, throw `INVALID_OP`; a height of 0 throws `INVALID_OP`.
+2. Raster formats are written at exactly that size and stretched when its aspect ratio differs from the area: a 400 x 300 px spread exported at 800 x 800 px drew its circle as an ellipse. Without a size, the area is written at one image pixel per document pixel, at any DPI (R-09).
+3. PDF and SVG ignore the size: with 800 x 600 px, a 400 x 300 px spread gave a PDF page of 400 x 300 pt and an SVG `viewBox` of 400 x 300.
+4. Speed: a 400 x 300 px spread at 4,000 x 3,000 px PNG took 548 ms; a spread of 202 nodes at 1,448 x 2,048 px took 154 ms as PNG and 144 ms as JPEG.
+
+### R-48 Export areas
+
+1. `FileExportArea.createForCurrentSpread()` writes one file under the given name, covering the page: a node reaching beyond the page is cut off.
+2. `createForSpreads('1')` counts spreads from 1 (`'0'` throws `INVALID_ARGS`) and appends `_1` to the file name. `createForWholeDocument()` writes one file per spread (`name_1.png`, `name_2.png`) for PNG, SVG and PSD, and one file with all pages for PDF.
+3. `createForSelection(selection)` and `createForSelectionArea(selection)` use the document's current selection whatever `Selection` object they get: a selection constructed for node b exported node a, which was selected. With an empty selection both throw `INVALID_OP`.
+4. `createForSelection` draws only the selected nodes, hidden ones included, over a transparent background. Its area is the union of the nodes' visible boxes (`spreadVisibleBox`, which includes strokes, shadows and blur), widened to whole pixels: a rectangle with the visible box x 40.61 to 180.61, y 40.61 to 140.61 gave 141 x 101 px. Children of a layer, a layer, and nodes on a spread that is not current export the same way. `createForSelectionArea` draws everything inside that area.
+5. JPEG places transparent areas on white. A document created with `isTransparentBackground` true exports PNG with an alpha channel; other documents export an opaque white background.
+
+### R-49 Preview selection
+
+1. `doc.executeCommand(DocumentCommand.createSetSelection(selection), true)`, the preview form, changes `doc.selection` without a history step and without touching the dirty flag, also on a saved, clean document.
+2. The next export uses that selection and ends the preview: afterwards `doc.selection` is again the selection from before the preview (checked with a selected node and with an empty selection), and history position and size are unchanged. A second export in the same script therefore sees the original selection.
+3. A preview replaces the previous one: a preview spread switch followed by a preview selection left the spread as before. After the preview, ordinary commands and `undo` behave normally (1 step for an insertion, undo back).
+4. Consequence: `render` and `export` select chosen nodes by preview and export once, leaving history, dirty flag and selection as they were.
+
+### R-50 Formats and presets
+
+1. `FileExportOptions.allPresetNames` lists 64 names: `PNG`, `PNG-8 (dithered)`, 4 `PNG-HDR` variants, `JPEG (Best quality)`, `JPEG (High quality)`, `JPEG (Medium quality)`, `JPEG (Low quality)`, `GIF RGB`, `GIF Grayscale`, 6 `TIFF` variants including `TIFF RGB 8-bit`, 4 `SVG` variants including `SVG (for export)`, 4 `EPS` variants including `EPS (for export)`, `PDF (for print)`, `PDF (press ready)`, `PDF (digital - small size)`, `PDF (digital - high quality)`, `PDF (for export)`, `PDF (flatten)`, `PDF/X-1a:2003`, `PDF/X-3:2003`, `PDF/X-4`, 4 `EPUB` variants, 2 `DWG` and 2 `DXF` variants, 3 `PSD` variants including `PSD (preserve editability)`, 2 `OpenEXR` variants, `Radiance HDR 32-bit linear`, `TGA`, `Enhanced Windows Metafile`, `Windows Metafile`, `Canva Design`, 7 `WebP` variants including `WebP (Lossless, default)`, and 4 `JPEG XL` variants.
+2. The preset decides the format; the file name is used as given: preset `PNG` written to `x.jpg` holds PNG data, and a name without an extension gets none.
+3. `FileExportOptions.createWithPresetName` with an unknown name throws `ERROR`.
+4. A 400 x 300 px spread exported in 16 to 177 ms as PNG, JPEG, SVG, PDF, TIFF, WebP, PSD, GIF and EPS.
+
+### R-51 Desktop sandbox for files
+
+1. Export, `saveAs`, `Document.load` and `Bitmap.loadFromFile` outside the Desktop (`C:\users\eugen\Documents`, `Z:\tmp`) throw `PERMISSION_DENIED`, as does a dot folder or a file name starting with a dot inside the Desktop. In the Wine prefix, `drive_c/users/eugen/Documents` links to `/home/eugen/Documents` just as the Desktop links to `/home/eugen/Desktop`; the sandbox still refuses it.
+2. Inside the Desktop, spaces, non-ASCII characters (`p5 space ü.png`) and forward slashes work. Export creates missing folders; `File.create(path, 'w')` in a missing folder throws `NO_SUCH_FILE_OR_DIRECTORY`; `FileSystemApi.createDirectories` and `FileSystemApi.exists` work.
+3. `Document.load` of a missing file, or of a file that is not an image or document, throws `PERMISSION_DENIED` as well.
+
+### R-52 Saving and loading
+
+1. A new document has `mustSaveAs` true; `save()` on it throws `SAVE_TO_TEMPORARY_ARCHIVE_ERROR`.
+2. `saveAs(path)` and `save()` return nothing, clear the dirty flag and leave the history unchanged. `saveAs` uses the path as given, without adding an extension; the title becomes the file name without `.af`.
+3. `saveAs` onto an existing file overwrites it without a warning.
+4. `Document.load` of a saved file gives a clean document at history 0 of 0 with its tags (`rect1`), and makes it current.
+5. Loading a file that is already open returns the open document (same `sessionUuid`) and does not make it current.
+6. `Document.load` also imports PNG (a `RasterNode`), SVG (vector nodes) and Affinity 2 `.afdesign` files. The imported PNG and SVG documents have `mustSaveAs` true and keep their extension in the title (`src.png`); the `.afdesign` document has `mustSaveAs` false.
+7. Under Wine an open document has a 99-byte `<file>~lock~` beside it. When the document is closed, or saved under another name, a 4-byte `<file>~lock~:com.dropbox.ignored` remains (R-13).
+8. Undoing back to the saved history position leaves `isDirty` true.
+
+### R-53 New documents
+
+1. `NewDocumentOptions.width` and `height` are in the document's `units`: `Pixel` 1,000 x 500 at 300 DPI gives 1,000 x 500 px; `Millimetre` 210 x 297 at 300 DPI gives 2,480.31 x 3,507.87 px.
+
+### R-54 Images
+
+1. `Bitmap.loadFromFile(path)` reads PNG, JPEG, WebP, TIFF and GIF, each as `RGBA8` at 300 x 200 px in 6 to 91 ms. SVG and the text file named `.png` throw `NOT_SUPPORTED`, a missing file throws `ERROR`, and a file outside the Desktop throws `PERMISSION_DENIED`.
+2. `ImageNodeDefinition.create(RasterFormat.RGBA8)` with `setBitmap(bitmap)`, inserted together with a tag in one compound command, adds 1 undo step. The node is an `ImageNode` named "Image" whose box is the bitmap size in document pixels at any DPI: 300 x 200 at 72 and at 300 DPI.
+3. The definition transform `(w / bw, 0, x, 0, h / bh, y)`, for a bitmap of `bw` x `bh` px, places the image in the box `[x, y, w, h]`; `get_nodes` reads the box back exactly, and transparency is kept.
+4. The bitmap is embedded: `imageFilePath` is empty, and after the source file was deleted the image still rendered and saved (the document file grew to 441,030 bytes).
+5. `rasterWidth` and `rasterHeight` give the pixel size. `hasBrushFill` is false; the pen fill exists with weight 0, so `get_nodes` reports `stroke: null`.
+
+### R-55 Setting name
+
+1. Affinity's English resources name the setting "Access files on your Desktop", described as "Open, edit and save files on your Desktop when required to complete tasks.", on the "Model Context Protocol" page of the settings.
+
+### R-56 Slice 004 implementation checks
+
+Measured 2026-10-18 by the slice 004 live suite and a timing script through the server.
+
+1. `ImageNodeDefinition` takes `userDescription` and a rotation in its transform like the other definitions: an image named "Photo", rotated by 30 degrees with opacity 0.5, read back with those values.
+2. `createForSelection` after a preview selection of a hidden node exports that node at its box: a hidden 20 x 10 px rectangle inside a layer gave a 20 x 10 px PNG.
+3. A document loaded from a copy in the staging folder and saved by `doc.save()` writes the copy; closing it in a separate script did not crash Affinity.
+4. A PNG export of a 1,000 x 1,000 px spread with 200 ellipses at 2,048 x 2,048 px took 555 to 840 ms through the server (staging, export and copy); a JPEG export of one node at 2,048 x 1,024 px for `render` took 517 to 538 ms.
+
